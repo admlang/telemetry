@@ -1,0 +1,11 @@
+// Datadog exporter for the Telemetry service
+@manifest(version = "0.0.1")
+library adm.telemetry.datadog {
+	use (
+		adm.telemetry.datadog
+	)
+
+	export (
+		adm.telemetry.datadog
+	)
+}

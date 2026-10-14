@@ -1,0 +1,3 @@
+partial module adm.telemetry.datadog {
+	// A std.services.telemetry exporter for Datadog: metrics (series and distributions), logs, events and traces to the intake APIs of a site, with tags, host, service, env and version conventions, batching and retry
+}

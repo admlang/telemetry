@@ -1,0 +1,11 @@
+// Sentry exporter for the Telemetry service
+@manifest(version = "0.0.1")
+library adm.telemetry.sentry {
+	use (
+		adm.telemetry.sentry
+	)
+
+	export (
+		adm.telemetry.sentry
+	)
+}

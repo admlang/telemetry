@@ -1,0 +1,3 @@
+partial module adm.telemetry.sentry {
+	// A std.services.telemetry exporter for Sentry, GlitchTip and self-hosted servers: errors as events with exceptions, stack traces, breadcrumbs, releases and environments, spans as transactions, check-ins for crons; DSN parsing, envelopes, rate limits
+}
