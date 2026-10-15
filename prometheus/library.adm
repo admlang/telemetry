@@ -1,0 +1,11 @@
+// Prometheus exporter for the Telemetry service
+@manifest(version = "0.1.0")
+library adm.telemetry.prometheus {
+	use (
+		adm.telemetry.prometheus
+	)
+
+	export (
+		adm.telemetry.prometheus
+	)
+}

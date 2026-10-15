@@ -1,0 +1,161 @@
+partial module adm.telemetry.statsd {
+	use (
+		std.metrics::(Distribution)
+		std.net
+		std.os
+		std.services::(Application)
+		std.services.telemetry::(ExportFailure, MetricSample, TelemetryBatch)
+		std.testing
+	)
+
+	// A StatsD server for the live test (`udp://host:8125`), which gets metrics under the
+	// prefix `adm-test.`.
+	@env("ADM_TEST_STATSD")
+	internal const liveServer string
+
+	// Every datagram that arrives on a socket within a short wait, as text.
+	internal def datagrams(server net.Socket) string[] {
+		let out = string[]
+		let buf = byte[]
+		buf.len(65536)
+		for {
+			let (n, _) = server.readFrom(buf, 300ms) onerror (err error) {
+				return out
+			}
+			out.push(string(buf[:n]))
+		}
+		return out
+	}
+
+	internal def sampleBatch() TelemetryBatch {
+		return TelemetryBatch{resource: {"service.name": "shop"}, metrics: [
+			MetricSample{name: "orders", kind: "counter", count: 5, labels: {"route": "/pay"}},
+			MetricSample{name: "temperature", kind: "gauge", value: -3.5},
+			MetricSample{name: "online", kind: "toggle", value: 1.0},
+			MetricSample{name: "latency", kind: "histogram", unit: "s", distribution: Distribution{bounds: [1.0], counts: [uint64(4), uint64(1)], sum: 5.1, count: uint64(5)}},
+		]}
+	}
+
+	check "StatsD exporter" {
+		@test()
+		def overUdp() !none {
+			let server = try net.socket(net.SocketDomain.IPv4, net.SocketType.Datagram)
+			try server.bind("127.0.0.1:0")
+			let exporter = new Exporter("udp://{server.localAddr().str()}")
+			exporter.prefix = "shop."
+			exporter.resourceTags = ["service.name"]
+			try exporter.export(sampleBatch())
+			let got = datagrams(server)
+			try testing.expectEqual(1, got.len(), "one packet")
+			let lines = got[0].split("\n")
+			let wanted = [
+				"shop.orders:5|c|#route:/pay,service.name:shop",
+				"shop.temperature:0|g|#service.name:shop",
+				"shop.temperature:-3.5|g|#service.name:shop",
+				"shop.online:1|g|#service.name:shop",
+				"shop.latency:917.0040432046712|ms|@0.25|#service.name:shop",
+				"shop.latency:1090.5077326652577|ms|#service.name:shop",
+			]
+			try testing.expectEqual(wanted.join("\n"), lines.join("\n"), "the lines")
+
+			// The next totals send what was added in between.
+			let next = TelemetryBatch{metrics: [
+				MetricSample{name: "orders", kind: "counter", count: 12, labels: {"route": "/pay"}},
+				MetricSample{name: "latency", kind: "histogram", unit: "s", distribution: Distribution{bounds: [1.0], counts: [uint64(4), uint64(3)], sum: 7.3, count: uint64(7)}},
+			]}
+			try exporter.export(next)
+			let again = datagrams(server)[0].split("\n")
+			try testing.expectEqual("shop.orders:7|c|#route:/pay", again[0], "a counter's difference")
+			try testing.expectEqual("shop.latency:1090.5077326652577|ms|@0.5", again[1], "a histogram's new values only")
+
+			exporter.packetSize = 60
+			try exporter.export(sampleBatch())
+			let small = datagrams(server)
+			try testing.expectTrue(small.len() > 1, "packets kept under packetSize")
+			for let packet in small {
+				try testing.expectTrue(packet.len() <= 60 || !packet.contains("\n"), "each within the size, or one line alone")
+			}
+			try exporter.close()
+			try server.close()
+			return none
+		}
+
+		@test()
+		def tagStyles() !none {
+			let exporter = new Exporter()
+			let labels = {"a": "x:y", "b": "2"}
+			try testing.expectEqual("m:1|c|#a:x_y,b:2", lineOf(exporter.tagStyle, "m", "1", "c", "", labels), "DogStatsD")
+			exporter.tagStyle = TagStyle.Influx
+			try testing.expectEqual("m,a=x_y,b=2:1|c", lineOf(exporter.tagStyle, "m", "1", "c", "", labels), "Influx")
+			exporter.tagStyle = TagStyle.Graphite
+			try testing.expectEqual("m;a=x_y;b=2:1|c|@0.5", lineOf(exporter.tagStyle, "m", "1", "c", "0.5", labels), "Graphite")
+			exporter.tagStyle = TagStyle.None
+			try testing.expectEqual("m.a_x_y.b_2:1|c", lineOf(exporter.tagStyle, "m", "1", "c", "", labels), "none: labels in the name")
+			try testing.expectEqual("a_b_c", metricName("a:b|c"), "reserved characters")
+			try testing.expectEqual("udp://127.0.0.1:8125", (new Exporter()).name().replace("statsd ", ""), "the default address")
+			return none
+		}
+
+		@test()
+		def overTcpAndUnix() !none {
+			let listener = try net.socket(net.SocketDomain.IPv4, net.SocketType.Stream)
+			try listener.bind("127.0.0.1:0")
+			let ln = try listener.listen(4)
+			let exporter = new Exporter("tcp://{ln.address().str()}")
+			exporter.tagStyle = TagStyle.None
+			try exporter.export(TelemetryBatch{metrics: [MetricSample{name: "a", kind: "gauge", value: 1.0}]})
+			let conn = try ln.accept()
+			let buf = byte[]
+			buf.len(4096)
+			let n = try conn.read(buf, 2s)
+			try testing.expectEqual("a:1|g\n", string(buf[:n]), "lines end with a newline")
+			// The server goes away; the next batch reconnects.
+			try conn.close()
+			exporter.export(TelemetryBatch{metrics: [MetricSample{name: "b", kind: "gauge", value: 2.0}]}) onerror recover none
+			try exporter.export(TelemetryBatch{metrics: [MetricSample{name: "c", kind: "gauge", value: 3.0}]})
+			let second = try ln.accept()
+			let m = try second.read(buf, 2s)
+			try testing.expectTrue(string(buf[:m]).contains("c:3|g\n"), "after a reconnect")
+			try second.close()
+			try ln.close()
+			try exporter.close()
+
+			let path = (try Application.home()) + "/statsd.sock"
+			os.remove(path) onerror recover none
+			let unixServer = try net.socket(net.SocketDomain.Unix, net.SocketType.Datagram)
+			try unixServer.bind(path)
+			let local = new Exporter("unixgram://{path}")
+			local.tagStyle = TagStyle.None
+			try local.export(TelemetryBatch{metrics: [MetricSample{name: "d", kind: "gauge", value: 4.0}]})
+			try testing.expectEqual("d:4|g", datagrams(unixServer)[0], "over a Unix datagram socket")
+			try local.close()
+			try unixServer.close()
+			os.remove(path) onerror recover none
+			return none
+		}
+
+		@test()
+		def unreachable() !none {
+			let exporter = new Exporter("tcp://127.0.0.1:1")
+			exporter.export(sampleBatch()) onerror (err error) {
+				fail "an unreachable server is an ExportFailure" unless err is ExportFailure
+				let failure ExportFailure = err
+				let rest = failure.rest
+				fail "the batch is kept" when rest is none
+				try testing.expectEqual(4, rest.metrics.len(), "all of it")
+				recover none
+			}
+			return none
+		}
+
+		@test()
+		def liveServerTakesLines() !none {
+			return none when liveServer.isEmpty()
+			let exporter = new Exporter(liveServer)
+			exporter.prefix = "adm-test."
+			try exporter.export(sampleBatch())
+			try exporter.close()
+			return none
+		}
+	}
+}

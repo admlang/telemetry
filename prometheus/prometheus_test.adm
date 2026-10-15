@@ -1,0 +1,375 @@
+partial module adm.telemetry.prometheus {
+	use (
+		std.bytes::(Buffer)
+		std.data.compress.gzip
+		std.data.compress.snappy
+		std.data.encoding::(ProtoEncoding, ProtoMessage, Protobuf)
+		std.io
+		std.metrics::(Distribution)
+		std.net.http
+		std.net.http.httptest
+		std.services.telemetry::(ExportFailure, MetricSample, TelemetryBatch)
+		std.testing
+		std.time
+	)
+
+	// A Prometheus server started with `--web.enable-remote-write-receiver` for the live
+	// test (`http://localhost:9090`): it writes series under the job `adm-test` and reads
+	// them back through the query API.
+	@env("ADM_TEST_PROMETHEUS")
+	internal const livePrometheus string
+
+	// One request the fake receiver took.
+	internal struct Received {
+		method  string
+		path    string
+		kind    string
+		version string
+		auth    string
+		body    byte[]
+	}
+
+	// A remote write receiver and Pushgateway on loopback: keeps every request (the body
+	// unpacked), answers with the statuses queued, else 204.
+	internal type FakeReceiver {
+		received   Received[]
+		statuses   int[]
+		retryAfter string
+		written    string
+
+		// Serve implements http.Handler.
+		def serve(ctx http.Context) !none {
+			let body = try ctx.bytes()
+			body = try snappy.decompress(body) when ctx.request.headers.get("Content-Encoding") == "snappy"
+			received.push(Received{method: "{ctx.request.method}", path: ctx.request.url.path, kind: ctx.request.headers.get("Content-Type"), version: ctx.request.headers.get("X-Prometheus-Remote-Write-Version"), auth: ctx.request.headers.get("Authorization"), body: body})
+			let status = 204
+			if statuses.len() > 0 {
+				status = statuses[0]
+				statuses = statuses[1:]
+			}
+			ctx.setHeader("Retry-After", retryAfter) unless retryAfter.isEmpty() || status < 300
+			ctx.setHeader("X-Prometheus-Remote-Write-Samples-Written", written) unless written.isEmpty()
+			return try ctx.text(status, status >= 400 ?? ("refused by the test", ""))
+		}
+	}
+
+	// The labels of a remote write 1.0 TimeSeries.
+	internal def labelsV1(series ProtoMessage) !map<string, string> {
+		let out = map<string, string>{}
+		for let field in series.all(1) {
+			let pair = try field.asMessage()
+			out[try pair.get(1).asString()] = try pair.get(2).asString()
+		}
+		return out
+	}
+
+	// Every TimeSeries of a 1.0 WriteRequest by its labels, `name{a=b,...}`.
+	internal def seriesV1(body byte[]) !map<string, ProtoMessage> {
+		let request = try (new Protobuf()).parse(body)
+		let out = map<string, ProtoMessage>{}
+		for let field in request.all(1) {
+			let series = try field.asMessage()
+			out[describe(try labelsV1(series))] = series
+		}
+		return out
+	}
+
+	internal def describe(labels map<string, string>) string {
+		let names = labels.keys().filter(n => n != "__name__")
+		names.sort((a, b) => a < b)
+		let name = labels.get("__name__")
+		return "{name is none ?? ("", name)}\{" + names.mapElem(n => "{n}={labels.get(n)}").join(",") + "}"
+	}
+
+	internal const testResource = {"service.name": "shop", "service.version": "1.4.0", "app.installation.id": "inst-7", "region": "eu"}
+
+	internal def sampleBatch(at int64) TelemetryBatch {
+		return TelemetryBatch{resource: testResource, metrics: [
+			MetricSample{name: "http.requests", kind: "counter", time: at, value: 5.0, count: 5, labels: {"http.route": "/pay"}, description: "Requests \"served\""},
+			MetricSample{name: "queue.depth", kind: "gauge", time: at, value: 3.5, unit: "By"},
+			MetricSample{name: "load", kind: "gauge", time: at, value: 0.25, unit: "1"},
+			MetricSample{name: "online", kind: "toggle", time: at, value: 1.0},
+			MetricSample{name: "latency", kind: "histogram", time: at, value: 1.0, unit: "s", distribution: Distribution{bounds: [1.0], counts: [uint64(4), uint64(2)], sum: 6.4, count: uint64(6)}},
+		]}
+	}
+
+	internal def failureOf(run def () !none) !ExportFailure {
+		run() onerror (err error) {
+			return err when err is ExportFailure
+			fail "failed with a plain error: {err.message}"
+		}
+		fail "did not fail"
+	}
+
+	check "Prometheus exporters" {
+		@test()
+		def namesUnitsAndNumbers() !none {
+			let counter = pointOf(MetricSample{name: "http.requests_total", kind: "counter", count: 3, unit: "s"}, {})
+			fail "a counter is a point" when counter is none
+			try testing.expectEqual("http_requests_seconds", counter.family, "sanitized, _total off, the unit on")
+			let ratio = pointOf(MetricSample{name: "load", kind: "gauge", unit: "1"}, {})
+			fail "a gauge is a point" when ratio is none
+			try testing.expectEqual("load_ratio", ratio.family, "a gauge of unit 1 is a ratio")
+			let rate = pointOf(MetricSample{name: "net.io", kind: "gauge", unit: "By/s"}, {})
+			fail "a gauge is a point" when rate is none
+			try testing.expectEqual("net_io_bytes_per_second", rate.family, "a rate unit")
+			let labelled = pointOf(MetricSample{name: "x", kind: "gauge", labels: {"a.b": "1", "a-b": "2", "__secret": "3", "9lives": "4"}}, {})
+			fail "a gauge is a point" when labelled is none
+			try testing.expectEqual("1;2", "{labelled.labels.get("a_b")}" == "1;2" || "{labelled.labels.get("a_b")}" == "2;1" ?? ("1;2", "{labelled.labels.get("a_b")}"), "names that sanitize alike keep both values")
+			try testing.expectTrue(labelled.labels.hasKey("key__secret"), "a reserved name is prefixed")
+			try testing.expectTrue(labelled.labels.hasKey("_9lives"), "a leading digit is prefixed")
+			try testing.expectEqual("_9lives", metricName("9lives"), "a metric name too")
+			try testing.expectEqual("1.0", canonical(1.0), "canonical numbers keep a point")
+			try testing.expectEqual("1.189207115002721", canonical(1.189207115002721), "and every digit")
+			try testing.expectEqual("1e-09", canonical(0.000000001), "or an exponent")
+			try testing.expectEqual("+Inf", canonical(float64(1.0 / 0.0)), "infinity")
+			try testing.expectEqual("123456789", shortest(123456789.0), "the shortest text that reads back")
+			let (spans, deltas, zero) = nativeOf(Point{ranges: {0: uint64(2), 128: uint64(4), 129: uint64(2), 132: uint64(1)}})
+			try testing.expectEqual(uint64(2), zero, "range 0 is the zero bucket")
+			try testing.expectEqual("0:2,2:1", spans.mapElem(s => "{s.offset}:{s.length}").join(","), "spans of buckets 0-1 and 4")
+			try testing.expectEqual("4,-2,-1", deltas.mapElem(d => "{d}").join(","), "counts as deltas")
+			return none
+		}
+
+		@test()
+		def textFormats() !none {
+			let points = Point[]
+			for let sample in sampleBatch(10000000000).metrics {
+				let point = pointOf(sample, {})
+				points.push(point) unless point is none
+			}
+			let created = canonical(float64(startMillis()) / 1000.0)
+			let plain = textOf(points, none, false)
+			let wanted = [
+				"# TYPE http_requests_total counter",
+				"# HELP http_requests_total Requests \"served\"",
+				"http_requests_total\{http_route=\"/pay\"} 5",
+				"# TYPE latency_seconds histogram",
+				"latency_seconds_bucket\{le=\"1\"} 4",
+				"latency_seconds_bucket\{le=\"1.189207115002721\"} 6",
+				"latency_seconds_bucket\{le=\"+Inf\"} 6",
+				"latency_seconds_count 6",
+				"latency_seconds_sum 6.4",
+				"# TYPE load_ratio gauge",
+				"load_ratio 0.25",
+				"# TYPE online gauge",
+				"online 1",
+				"# TYPE queue_depth_bytes gauge",
+				"queue_depth_bytes 3.5",
+			]
+			try testing.expectEqual(wanted.join("\n") + "\n", plain, "the text format 0.0.4")
+			let open = textOf(points, {"region": "eu"}, true)
+			try testing.expectTrue(open.startsWith("# TYPE target info\ntarget_info\{region=\"eu\"} 1\n# TYPE http_requests counter\n"), "OpenMetrics: target_info first, counters by family name")
+			try testing.expectTrue(open.contains("http_requests_created\{http_route=\"/pay\"} {created}\n"), "with _created")
+			try testing.expectTrue(open.contains("# UNIT latency_seconds seconds\n"), "the unit")
+			try testing.expectTrue(open.contains("latency_seconds_bucket\{le=\"1.0\"} 4\n"), "canonical le")
+			try testing.expectTrue(open.contains("# HELP http_requests Requests \\\"served\\\"\n"), "HELP with quotes escaped")
+			try testing.expectTrue(open.endsWith("# EOF\n"), "ends with # EOF")
+			return none
+		}
+
+		@test()
+		def remoteWriteV1() !none {
+			let fake = new FakeReceiver()
+			let server = try httptest.Server.start(fake)
+			let exporter = new Exporter(server.url + "/api/v1/write")
+			exporter.headers["Authorization"] = "Bearer t0k"
+			exporter.nativeHistograms = true
+			try exporter.export(sampleBatch(10000000000))
+			try testing.expectEqual(1, fake.received.len(), "one request")
+			let got = fake.received[0]
+			try testing.expectEqual("application/x-protobuf", got.kind, "protobuf")
+			try testing.expectEqual("0.1.0", got.version, "remote write 1.0")
+			try testing.expectEqual("Bearer t0k", got.auth, "the headers")
+			let series = try seriesV1(got.body)
+			let counter = series.get("http_requests_total\{http_route=/pay,instance=inst-7,job=shop}")
+			fail "the counter with job and instance: {series.keys()}" when counter is none
+			let sample = try counter.get(2).asMessage()
+			try testing.expectEqual(5.0, try sample.get(1).asFloat(), "its total")
+			try testing.expectEqual(10000, try sample.get(2).asInt(), "at the reading's millisecond")
+			try testing.expectTrue(series.hasKey("latency_seconds_bucket\{instance=inst-7,job=shop,le=1.189207115002721}"), "classic buckets")
+			try testing.expectTrue(series.hasKey("latency_seconds_bucket\{instance=inst-7,job=shop,le=+Inf}"), "up to +Inf")
+			try testing.expectTrue(series.hasKey("target_info\{instance=inst-7,job=shop,region=eu,service_version=1.4.0}"), "target_info with the resource")
+			let native = series.get("latency_seconds\{instance=inst-7,job=shop}")
+			fail "a native histogram series" when native is none
+			let histogram = try native.get(4).asMessage()
+			try testing.expectEqual(6, try histogram.get(1).asInt(), "its count")
+			try testing.expectEqual(2, try histogram.get(4).asInt(ProtoEncoding.ZigZag), "schema 2")
+			let span = try histogram.get(11).asMessage()
+			try testing.expectEqual(0, try span.get(1).asInt(ProtoEncoding.ZigZag), "from bucket 0")
+			try testing.expectEqual(2, try span.get(2).asInt(), "two buckets")
+			try testing.expectEqual("4,-2", (try histogram.get(12).asInts(ProtoEncoding.ZigZag)).mapElem(d => "{d}").join(","), "4 values up to 1, 2 above")
+			let request = try (new Protobuf()).parse(got.body)
+			let kinds = map<string, int>{}
+			for let field in request.all(3) {
+				let described = try field.asMessage()
+				kinds[try described.get(2).asString()] = try described.get(1).asInt()
+			}
+			try testing.expectEqual(1, kinds["http_requests"], "counter metadata")
+			try testing.expectEqual(3, kinds["latency_seconds"], "histogram metadata")
+
+			// A series that stops arriving ends with a staleness marker.
+			exporter.stale = 1ns
+			time.sleep(2ms)
+			fake.received = Received[]
+			try exporter.export(TelemetryBatch{resource: testResource, metrics: [MetricSample{name: "load", kind: "gauge", time: 20000000000, value: 0.5, unit: "1"}]})
+			let after = try seriesV1(fake.received[0].body)
+			let ended = after.get("queue_depth_bytes\{instance=inst-7,job=shop}")
+			fail "the gauge that stopped gets a marker" when ended is none
+			try testing.expectEqual(staleBits, try (try ended.get(2).asMessage()).get(1).asUint(ProtoEncoding.Fixed), "a staleness NaN")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def remoteWriteV2AndRefusals() !none {
+			let fake = new FakeReceiver()
+			let server = try httptest.Server.start(fake)
+			let exporter = new Exporter(server.url + "/api/v1/write")
+			exporter.version = RemoteWriteVersion.V2
+			try exporter.export(sampleBatch(10000000000))
+			let got = fake.received[0]
+			try testing.expectEqual("application/x-protobuf;proto=io.prometheus.write.v2.Request", got.kind, "the 2.0 content type")
+			try testing.expectEqual("2.0.0", got.version, "remote write 2.0")
+			let request = try (new Protobuf()).parse(got.body)
+			let symbols = request.all(4).mapElem(f => f.asString() onerror recover "?")
+			try testing.expectEqual("", symbols[0], "the empty symbol first")
+			let found = false
+			for let field in request.all(5) {
+				let series = try field.asMessage()
+				let refs = try series.get(1).asUint32s()
+				let labels = map<string, string>{}
+				for let i = 0; i + 1 < refs.len(); i += 2 {
+					labels[symbols[int(refs[i])]] = symbols[int(refs[i + 1])]
+				}
+				continue unless labels["__name__"] == "http_requests_total"
+				found = true
+				let sample = try series.get(2).asMessage()
+				try testing.expectEqual(startMillis(), int64(try sample.get(3).asInt()), "a counter's start time")
+				let described = try series.get(5).asMessage()
+				try testing.expectEqual(1, try described.get(1).asInt(), "typed counter")
+				try testing.expectEqual("Requests \"served\"", symbols[try described.get(3).asInt()], "its help")
+			}
+			try testing.expectTrue(found, "the counter is there")
+
+			fake.written = "3"
+			let short = try failureOf(() => exporter.export(sampleBatch(20000000000)))
+			try testing.expectTrue(short.rejected > 0, "series the receiver did not write are refused")
+			fake.written = ""
+
+			fake.statuses = [503]
+			fake.retryAfter = "9"
+			let busy = try failureOf(() => exporter.export(sampleBatch(30000000000)))
+			try testing.expectEqual(0, busy.rejected, "a 503 refuses nothing")
+			try testing.expectEqual(9s, busy.retryAfter, "the pause asked for")
+			let rest = busy.rest
+			fail "the samples are kept" when rest is none
+			try testing.expectEqual(5, rest.metrics.len(), "all of them")
+			fake.statuses = [400]
+			let refused = try failureOf(() => exporter.export(sampleBatch(40000000000)))
+			try testing.expectEqual(5, refused.rejected, "a 400 refuses the request's samples")
+			try testing.expectTrue(refused.cause is PrometheusError, "with a PrometheusError")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def pushgateway() !none {
+			let fake = new FakeReceiver()
+			let server = try httptest.Server.start(fake)
+			let gateway = new Pushgateway(server.url + "/", job = "nightly")
+			try gateway.export(sampleBatch(10000000000))
+			let got = fake.received[0]
+			try testing.expectEqual("PUT", got.method, "a push replaces the group")
+			try testing.expectEqual("/metrics/job/nightly/instance/inst-7", got.path, "under job and instance")
+			try testing.expectTrue(string(got.body).contains("http_requests_total\{http_route=\"/pay\"} 5\n"), "in the text format")
+			try testing.expectTrue(string(got.body).contains("target_info\{region=\"eu\",service_version=\"1.4.0\"} 1\n"), "with target_info")
+			gateway.grouping = {"path": "/var/data", "empty": ""}
+			try testing.expectEqual("/metrics/job/nightly/empty@base64/=/path@base64/L3Zhci9kYXRh", gateway.path(), "values with / in base64")
+			try gateway.delete()
+			try testing.expectEqual("DELETE", fake.received[1].method, "delete removes the group")
+			fake.statuses = [500]
+			let busy = try failureOf(() => gateway.export(sampleBatch(20000000000)))
+			let rest = busy.rest
+			fail "a failed push is kept" when rest is none
+			try server.close()
+			return none
+		}
+
+		@test()
+		def scrapeEndpoint() !none {
+			let open = new Endpoint("0.0.0.0:0")
+			let refused = false
+			open.start() onerror (err error) {
+				refused = err is PrometheusError
+				recover none
+			}
+			try testing.expectTrue(refused, "no token or certificates: no listener beyond loopback")
+			try testing.expectTrue(isLoopback("127.0.0.1:9464") && isLoopback("[::1]:9464") && isLoopback("localhost:1"), "loopback addresses")
+			try testing.expectFalse(isLoopback(":9464") || isLoopback("10.0.0.1:9464"), "others")
+
+			let page = new Endpoint("127.0.0.1:0")
+			try page.export(sampleBatch(10000000000))
+			let base = "http://{page.address()}"
+			let web = new http.Client("", 5s)
+			let missing = try web.get(base + "/other")
+			try testing.expectEqual(404, missing.status, "only /metrics")
+			let plain = try web.get(base + "/metrics")
+			try testing.expectEqual(200, plain.status, "the page")
+			try testing.expectTrue(plain.headers.get("Content-Type").startsWith("text/plain; version=0.0.4"), "text by default")
+			try testing.expectTrue((try plain.text()).contains("queue_depth_bytes 3.5\n"), "with the readings")
+			let asked = try http.newRequest(http.Method.GET, base + "/metrics")
+			asked.headers.set("Accept", "application/openmetrics-text;version=1.0.0,text/plain;version=0.0.4;q=0.5")
+			let open1 = try web.do(asked)
+			try testing.expectTrue(open1.headers.get("Content-Type").startsWith("application/openmetrics-text"), "OpenMetrics when asked")
+			try testing.expectTrue((try open1.text()).endsWith("# EOF\n"), "complete")
+			let proto = try http.newRequest(http.Method.GET, base + "/metrics")
+			proto.headers.set("Accept", "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7")
+			let binary = try (try web.do(proto)).bytes()
+			// The first delimited MetricFamily is the counter.
+			let length = int(binary[0])
+			let family = try (new Protobuf()).parse(binary[1:1 + length])
+			try testing.expectEqual("http_requests_total", try family.get(1).asString(), "protobuf families")
+			try testing.expectEqual(0, try family.get(3).asInt(), "a counter")
+			try page.close()
+
+			let guarded = new Endpoint("0.0.0.0:0")
+			guarded.token = "s3cret"
+			try guarded.export(sampleBatch(10000000000))
+			let port = guarded.address().split(":").last()
+			let denied = try web.get("http://127.0.0.1:{port}/metrics")
+			try testing.expectEqual(401, denied.status, "a scrape without the token is refused")
+			let shown = try http.newRequest(http.Method.GET, "http://127.0.0.1:{port}/metrics")
+			shown.headers.set("Authorization", "Bearer s3cret")
+			shown.headers.set("Accept-Encoding", "gzip")
+			let raw = new http.Client("", 5s)
+			raw.decompress = false
+			let allowed = try raw.do(shown)
+			try testing.expectEqual(200, allowed.status, "with it, the page")
+			try testing.expectEqual("gzip", allowed.headers.get("Content-Encoding"), "compressed when asked")
+			let unpacked = try io.readAll(new gzip.Reader(new Buffer(try allowed.bytes())))
+			try testing.expectTrue(string(unpacked).contains("online 1\n"), "which unpacks to the page")
+			try guarded.close()
+			return none
+		}
+
+		@test()
+		def livePrometheusServer() !none {
+			return none when livePrometheus.isEmpty()
+			for let version in [RemoteWriteVersion.V1, RemoteWriteVersion.V2] {
+				let exporter = new Exporter(livePrometheus + "/api/v1/write")
+				exporter.version = version
+				exporter.job = "adm-test"
+				exporter.instance = "v{int(version) + 1}"
+				exporter.nativeHistograms = true
+				try exporter.export(sampleBatch(time.wallNs()))
+			}
+			let web = new http.Client("", 10s)
+			for let instance in ["v1", "v2"] {
+				let answer = try (try web.get(livePrometheus + "/api/v1/query?query=http_requests_total%7Bjob%3D%22adm-test%22%2Cinstance%3D%22{instance}%22%7D")).text()
+				try testing.expectTrue(answer.contains("\"value\":[") && answer.contains("\"5\"]"), "Prometheus reads the counter back ({instance}): {answer}")
+			}
+			return none
+		}
+	}
+}

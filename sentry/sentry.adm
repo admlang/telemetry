@@ -1,3 +1,515 @@
 partial module adm.telemetry.sentry {
-	// A std.services.telemetry exporter for Sentry, GlitchTip and self-hosted servers: errors as events with exceptions, stack traces, breadcrumbs, releases and environments, spans as transactions, check-ins for crons; DSN parsing, envelopes, rate limits
+	use (
+		std.bytes::(Buffer)
+		std.data.compress.gzip
+		std.data.encoding::(JSON)
+		std.net.http
+		std.net.tls
+		std.services.logging::(LogLevel, LogRecord)
+		std.services.runtime::(Runtime)
+		std.services.telemetry::(ErrorReport, ExportFailure, SpanRecord, TelemetryBatch)
+		std.time
+	)
+
+	// The most bytes one event or transaction may take; Sentry drops a larger one.
+	internal const largestEvent = 1048576
+
+	// The most log records one envelope carries.
+	internal const logsPerEnvelope = 100
+
+	// Sends what the Telemetry service collects to Sentry, self-hosted Sentry or GlitchTip
+	// over the envelope protocol.
+	//
+	// Error reports become events: the error's type and message as the exception, its
+	// stack as frames (the application's own marked in-app), the span it was reported in
+	// as the trace context, its fields as extra data (`user.id`, `user.email`,
+	// `user.name` and `client.address` as the user, `url.full`, `http.request.method` and
+	// `url.query` as the request), the log records, usage events and span events before it
+	// as breadcrumbs. A record written with `Logging.fatal` is a fatal event.
+	//
+	// Spans become transactions: a span with no parent, or with a parent in another
+	// program, is one, and the spans that ran inside it are its child spans. `sampleRate`
+	// sends that share of traces, decided by the trace id so every program of a trace
+	// agrees. A span's `sentry.op` attribute is its operation.
+	//
+	// Log records also go as Sentry logs when `logs` is on. Metrics are not sent.
+	//
+	// The release defaults to `SENTRY_RELEASE`, else `<service.name>@<service.version>`;
+	// the environment to `SENTRY_ENVIRONMENT`, else the resource's
+	// `deployment.environment.name`, else `production`. Other resource attributes are tags.
+	//
+	// The server's rate limits are kept per category (`X-Sentry-Rate-Limits`, a 429's
+	// `Retry-After`): what falls under one is dropped, and drops are reported to Sentry as
+	// client reports. What the server refuses for good is dropped; what it could not take
+	// (no answer, a 5xx) is kept for another try. Connecting needs the
+	// `adm.network.connect` permission for the DSN's host.
+	//
+	// ```
+	// let st = new sentry.Exporter("https://key@o1.ingest.sentry.io/42")
+	// st.environment = "staging"
+	// ```
+	type Exporter {
+		// The release events name, `shop@1.4.0`.
+		release     string                      = ""
+		// The environment events name, `production`.
+		environment string                      = ""
+		// The machine events name; the resource's `host.name` when empty.
+		serverName  string                      = ""
+		// The share of traces whose transactions are sent, 0.0 to 1.0. Errors always go.
+		sampleRate  float64                     = 1.0
+		// Whether log records also go as Sentry logs (billed by Sentry; GlitchTip ignores
+		// them).
+		logs        bool                        = false
+		// The most breadcrumbs an event carries, the latest ones.
+		breadcrumbs int                         = 100
+		// Tags every event and transaction carries.
+		tags        map<string, string>         = map<string, string>{}
+		// The fingerprint of an error report's event, for grouping it other than by its
+		// stack; none or an empty result groups by Sentry's rules.
+		fingerprint ?def (ErrorReport) string[] = none
+		// How long one request may take.
+		timeout     duration                    = 10s
+		// Whether envelopes are gzip-compressed.
+		compress    bool                        = true
+		// TLS settings for an https DSN; none trusts the system's roots. Read when the
+		// first envelope is sent.
+		tls         ?tls.Config                 = none
+
+		internal dsnText  string
+		internal parsed   ?Dsn         = none
+		internal web      ?http.Client = none
+		internal limits   Limits
+		internal spans    Spans
+		internal crumbs   Trail
+		// The trace id a log record written outside any span is sent under: Sentry needs
+		// one, and this keeps a run's records together.
+		internal runTrace string
+		// Check-ins on their way.
+		internal sending  AsyncScope
+
+		// dsn is the project's DSN; `SENTRY_DSN` when empty.
+		def new(dsn string = "") {
+			let fromEnv = Runtime.getEnv("SENTRY_DSN")
+			dsnText = dsn.isEmpty() && !(fromEnv is none) ?? (fromEnv, dsn)
+			let namedRelease = Runtime.getEnv("SENTRY_RELEASE")
+			release = namedRelease unless namedRelease is none
+			let namedEnvironment = Runtime.getEnv("SENTRY_ENVIRONMENT")
+			environment = namedEnvironment unless namedEnvironment is none
+			limits = new Limits()
+			spans = new Spans()
+			crumbs = new Trail()
+			runTrace = eventId()
+			sending = new AsyncScope(failFast = false)
+		}
+
+		// Name implements Exporter: `sentry` and the DSN's host and project.
+		def name() string {
+			let dsn = parseDsn(dsnText) onerror (err error) {
+				return "sentry"
+			}
+			return "sentry {dsn.host}{dsn.prefix}/{dsn.project}"
+		}
+
+		// Export implements Exporter.
+		//
+		// Fails with an ExportFailure when the server did not take every record: the DSN
+		// does not parse, the server cannot be reached or does not answer in time, answers
+		// with a failure, or a rate limit dropped records.
+		def export(batch TelemetryBatch) !none {
+			let dsn = parseDsn(dsnText) onerror (err error) {
+				fail ExportFailure{message: err.message, cause: err, rejected: batch.errors.len() + batch.spans.len() + (logs ?? (batch.logs.len(), 0))}
+			}
+			let scope = scopeOf(batch.resource, release, environment, serverName, tags)
+			crumbs.keep(batch)
+			let units = Unit[]
+			for let report in batch.errors {
+				units.push(errorUnit(report, scope, dsn))
+			}
+			crumbs.trim(breadcrumbs)
+			for let tree in spans.gather(batch.spans) {
+				let (kept, draw) = keeps(tree.root.context.trace, sampleRate)
+				if !kept {
+					limits.drop("sample_rate", categoryTransaction, 1)
+					limits.drop("sample_rate", categorySpan, tree.children.len() + 1)
+					continue
+				}
+				units.push(transactionUnit(tree, scope, dsn, draw))
+			}
+			if logs {
+				let entries = batch.logs
+				let at = 0
+				for at < entries.len() {
+					let end = at + logsPerEnvelope > entries.len() ?? (entries.len(), at + logsPerEnvelope)
+					units.push(logUnit(entries[at:end], scope))
+					at = end
+				}
+			}
+			return try deliver(units, batch.resource, dsn)
+		}
+
+		// Sends units in order. Fails with an ExportFailure naming what was dropped and
+		// what is to be sent again.
+		internal def deliver(units Unit[], resource map<string, string>, dsn Dsn) !none {
+			let failure = ExportFailure{}
+			let rest = TelemetryBatch{resource: resource}
+			let stopped = false
+			for let unit in units {
+				if stopped {
+					unit.keepIn(rest)
+					continue
+				}
+				if limits.paused(unit.category) {
+					unit.dropped(limits, "ratelimit_backoff")
+					failure.rejected += unit.size()
+					failure.message = "sentry: rate limited: {unit.category}" when failure.message.isEmpty()
+					continue
+				}
+				let outcome = post(dsn, unit.item, unit.header)
+				if outcome.again {
+					stopped = true
+					unit.keepIn(rest)
+					failure.retryAfter = outcome.wait
+					failure.message = outcome.message
+					failure.cause = outcome.cause
+					continue
+				}
+				continue when outcome.accepted
+				// A 429 is counted by the server itself; anything else refused is reported.
+				unit.dropped(limits, "send_error") unless outcome.limited
+				failure.rejected += unit.size()
+				if failure.message.isEmpty() {
+					failure.message = outcome.message
+					failure.cause = outcome.cause
+				}
+			}
+			return none when failure.message.isEmpty()
+			failure.rest = rest when stopped
+			fail failure
+		}
+
+		// The unit of an error report.
+		internal def errorUnit(report ErrorReport, scope Scope, dsn Dsn) Unit {
+			let grouped = string[]
+			let rule = fingerprint
+			grouped = rule(report) unless rule is none
+			let id = eventId()
+			let event = errorEvent(id, report, scope, crumbs.before(report.time, breadcrumbs), grouped)
+			let category = event.hasKey("exception") ?? (categoryError, "default")
+			let header = map<string, any>{"event_id": id}
+			let within = report.span
+			if !(within is none) {
+				let (kept, draw) = keeps(within.trace, sampleRate)
+				header["trace"] = samplingContext(within.trace, dsn, scope, draw, kept, "")
+			}
+			let item = encoded(event, "event")
+			// An event too large loses its breadcrumbs and extra data first.
+			if item.len() > largestEvent {
+				event.delete("breadcrumbs")
+				event.delete("extra")
+				item = encoded(event, "event")
+			}
+			let unit = new Unit(category, header, item)
+			unit.errors = [report]
+			return unit
+		}
+
+		// The unit of a transaction.
+		internal def transactionUnit(tree Tree, scope Scope, dsn Dsn, draw float64) Unit {
+			let id = eventId()
+			let event = transactionEvent(id, tree, scope)
+			let item = encoded(event, "transaction")
+			// A transaction too large keeps its earliest spans.
+			let children = tree.children
+			for item.len() > largestEvent && children.len() > 0 {
+				children = children[:children.len() / 2]
+				event = transactionEvent(id, Tree{root: tree.root, children: children}, scope)
+				item = encoded(event, "transaction")
+			}
+			let lost = tree.children.len() - children.len()
+			limits.drop("invalid", categorySpan, lost)
+			let header = map<string, any>{
+				"event_id": id,
+				"trace":    samplingContext(tree.root.context.trace, dsn, scope, draw, true, tree.root.name),
+			}
+			let unit = new Unit(categoryTransaction, header, item)
+			unit.spans = [tree.root] + tree.children
+			return unit
+		}
+
+		// The unit of up to `logsPerEnvelope` log records.
+		internal def logUnit(entries LogRecord[], scope Scope) Unit {
+			let items = any[]
+			for let entry in entries {
+				items.push(logEntry(entry, scope, runTrace))
+			}
+			let payload = (new JSON()).encode({"version": 2, "ingest_settings": {"infer_ip": "never", "infer_user_agent": "never"}, "items": items})
+			let item = itemOf({"type": "log", "item_count": entries.len(), "content_type": "application/vnd.sentry.items.log+json"}, payload)
+			let unit = new Unit(categoryLog, map<string, any>{}, item)
+			unit.logs = entries
+			unit.bytes = payload.len()
+			return unit
+		}
+
+		// The dynamic sampling context of a trace, for the envelope header.
+		internal def samplingContext(trace string, dsn Dsn, scope Scope, draw float64, kept bool, named string) map<string, any> {
+			let context = map<string, any>{
+				"trace_id":    trace,
+				"public_key":  dsn.publicKey,
+				"sample_rate": "{sampleRate}",
+				"sample_rand": "%.6f".format(draw),
+				"sampled":     kept ?? ("true", "false"),
+			}
+			context["release"] = scope.release unless scope.release.isEmpty()
+			context["environment"] = scope.environment unless scope.environment.isEmpty()
+			context["transaction"] = named unless named.isEmpty()
+			return context
+		}
+
+		// Sends one envelope of item, with the client report waiting when there is one.
+		internal def post(dsn Dsn, item byte[], header map<string, any>) Outcome {
+			let codec = new JSON()
+			let head = header.clone()
+			head["sent_at"] = time.now().str()
+			head["sdk"] = sdkInfo()
+			let items = item
+			let counts = limits.take()
+			items = items + itemOf({"type": "client_report"}, codec.encode(reportOf(counts))) unless counts.len() == 0
+			let outcome = send(dsn, envelopeOf(head, items))
+			limits.restore(counts) when outcome.again
+			return outcome
+		}
+
+		// Posts an envelope and reads how the server took it.
+		internal def send(dsn Dsn, envelope byte[]) Outcome {
+			let target = envelopeURL(dsn)
+			let response = request(dsn, target, envelope) onerror (err error) {
+				let cause = SentryError{message: "sentry: {target}: {err.message}", code: "Unreachable", kind: ErrorKind.Unreachable, cause: err}
+				return Outcome{again: true, message: cause.message, cause: cause}
+			}
+			response.bytes() onerror recover byte[]
+			let pause = limits.learn(response.status, response.headers.get("X-Sentry-Rate-Limits"), response.headers.get("Retry-After"))
+			return Outcome{accepted: true} when response.status >= 200 && response.status < 300
+			let said = response.headers.get("X-Sentry-Error")
+			let message = "sentry: {target} answered {response.status}" + (said.isEmpty() ?? ("", ": {said}"))
+			let cause = SentryError{message: message, code: "{response.status}", status: response.status, serverText: said, retryAfter: pause}
+			if response.status == 429 {
+				cause.kind = ErrorKind.RateLimited
+				return Outcome{limited: true, message: message, cause: cause}
+			}
+			if response.status >= 500 {
+				cause.kind = ErrorKind.ServerError
+				return Outcome{again: true, wait: pauseOf(response.headers.get("Retry-After")), message: message, cause: cause}
+			}
+			cause.kind = ErrorKind.Refused
+			return Outcome{message: message, cause: cause}
+		}
+
+		// Builds and sends one request. Fails when the body cannot be compressed or no
+		// answer arrives in time.
+		internal def request(dsn Dsn, target string, envelope byte[]) !http.Response {
+			let payload = envelope
+			if compress {
+				let packed = new Buffer()
+				let packer = new gzip.Writer(packed)
+				try packer.write(envelope)
+				try packer.close()
+				payload = packed.bytes()
+			}
+			let made = try http.newRequest(http.Method.POST, target, payload)
+			made.headers.set("Content-Type", "application/x-sentry-envelope")
+			made.headers.set("Content-Encoding", "gzip") when compress
+			made.headers.set("X-Sentry-Auth", authHeader(dsn))
+			made.headers.set("User-Agent", "{sdkName}/{sdkVersion}")
+			return try client().do(made)
+		}
+
+		// The HTTP client, made on first use.
+		internal def client() http.Client {
+			let held = web
+			return held unless held is none
+			let made = new http.Client("", timeout)
+			let secured = tls
+			if !(secured is none) {
+				let transport = new http.Transport()
+				transport.tls = secured
+				made.transport = transport
+			}
+			web = made
+			return made
+		}
+
+		// A monitor of the scheduled job slug, whose runs are reported as check-ins.
+		def monitor(slug string) Monitor {
+			return new Monitor(self, slug)
+		}
+
+		// Sends one check-in payload (`Monitor.payload`) and returns whether the server
+		// took it; what `CheckIn` uses.
+		def checkIn(payload map<string, any>) bool {
+			let dsn = parseDsn(dsnText) onerror (err error) {
+				return false
+			}
+			if limits.paused(categoryMonitor) {
+				limits.drop("ratelimit_backoff", categoryMonitor, 1)
+				return false
+			}
+			let outcome = post(dsn, itemOf({"type": "check_in"}, (new JSON()).encode(payload)), map<string, any>{})
+			limits.drop("network_error", categoryMonitor, 1) when outcome.again
+			limits.drop("send_error", categoryMonitor, 1) when !outcome.accepted && !outcome.again && !outcome.limited
+			return outcome.accepted
+		}
+
+		// Starts sending a check-in payload on a task of its own, which `close` waits for;
+		// what `Monitor.start` uses.
+		def checkInLater(payload map<string, any>) async bool {
+			return async<sending> checkIn(payload)
+		}
+
+		// Close implements Exporter: sends the transactions of spans still waiting for
+		// their parent and the drops not reported yet, and waits for the check-ins on
+		// their way. Does not fail: what cannot be sent now is lost with the exporter.
+		def close() !none {
+			sending.timeout(timeout)
+			await sending onerror recover none
+			let dsn = parseDsn(dsnText) onerror (err error) {
+				return none
+			}
+			let scope = scopeOf(map<string, string>{}, release, environment, serverName, tags)
+			let units = Unit[]
+			for let tree in spans.drain() {
+				let (kept, draw) = keeps(tree.root.context.trace, sampleRate)
+				units.push(transactionUnit(tree, scope, dsn, draw)) when kept
+			}
+			deliver(units, map<string, string>{}, dsn) onerror recover none
+			let counts = limits.take()
+			send(dsn, envelopeOf(map<string, any>{"sent_at": time.now().str()}, itemOf({"type": "client_report"}, (new JSON()).encode(reportOf(counts))))) unless counts.len() == 0
+			web = none
+			return none
+		}
+	}
+
+	// How the server took one envelope.
+	internal struct Outcome {
+		// The server answered with success.
+		accepted bool
+		// The records are to be sent again.
+		again    bool
+		// The server answered 429.
+		limited  bool
+		// How long the server asked to wait first.
+		wait     duration
+		message  string
+		cause    ?error   = none
+	}
+
+	// One envelope's worth of records: an event, a transaction or a batch of logs.
+	internal type Unit {
+		category string
+		header   map<string, any>
+		item     byte[]
+		// The records it was made of, to keep for another try.
+		errors   ErrorReport[]
+		spans    SpanRecord[]
+		logs     LogRecord[]
+		// The bytes of the logs it carries.
+		bytes    int
+
+		def new(category string, header map<string, any>, item byte[]) {
+			self.category = category
+			self.header = header
+			self.item = item
+		}
+
+		// How many records it holds.
+		def size() int {
+			return errors.len() + spans.len() + logs.len()
+		}
+
+		// Adds its records to rest.
+		def keepIn(rest TelemetryBatch) {
+			rest.errors = rest.errors + errors
+			rest.spans = rest.spans + spans
+			rest.logs = rest.logs + logs
+		}
+
+		// Records that it was dropped for reason.
+		def dropped(limits Limits, reason string) {
+			switch category {
+				case categoryTransaction:
+					limits.drop(reason, categoryTransaction, 1)
+					limits.drop(reason, categorySpan, spans.len())
+				case categoryLog:
+					limits.drop(reason, categoryLog, logs.len())
+					limits.drop(reason, categoryLogBytes, bytes)
+				default:
+					limits.drop(reason, category, 1)
+			}
+		}
+	}
+
+	// The breadcrumbs kept between batches: the latest log records, usage events and span
+	// events, oldest first.
+	internal type Trail {
+		internal crumbs Crumb[]
+
+		def new() {}
+
+		// Adds the batch's records. They all stay until `trim`, so every error of the
+		// batch finds the breadcrumbs before it.
+		atomic def keep(batch TelemetryBatch) {
+			let added = Crumb[]
+			for let entry in batch.logs {
+				// A fatal record is an error report of its own.
+				let level = entry.level
+				continue when !(level is none) && level == LogLevel.Fatal
+				added.push(logCrumb(entry))
+			}
+			for let used in batch.events {
+				added.push(usageCrumb(used))
+			}
+			for let span in batch.spans {
+				for let happened in span.events {
+					added.push(spanCrumb(happened))
+				}
+			}
+			return when added.len() == 0
+			let all = crumbs + added
+			all.sort((a, b) => a.time < b.time)
+			crumbs = all
+		}
+
+		// Keeps the latest most breadcrumbs.
+		atomic def trim(most int) {
+			crumbs = crumbs.len() > most ?? (crumbs[crumbs.len() - most:], crumbs)
+		}
+
+		// The latest most breadcrumbs at or before time.
+		atomic def before(time int64, most int) Crumb[] {
+			let shown = crumbs.filter(c => c.time <= time)
+			return shown.len() > most ?? (shown[shown.len() - most:], shown)
+		}
+	}
+
+	// An envelope item: its header with the payload's length, the payload, a newline.
+	internal def itemOf(header map<string, any>, payload byte[]) byte[] {
+		let head = header.clone()
+		head["length"] = payload.len()
+		let out = (new JSON()).encode(head)
+		out.push(byte(10))
+		out = out + payload
+		out.push(byte(10))
+		return out
+	}
+
+	// An event or transaction as an envelope item.
+	internal def encoded(event map<string, any>, kind string) byte[] {
+		return itemOf({"type": kind}, (new JSON()).encode(event))
+	}
+
+	// An envelope of one header and its items.
+	internal def envelopeOf(header map<string, any>, items byte[]) byte[] {
+		let out = (new JSON()).encode(header)
+		out.push(byte(10))
+		return out + items
+	}
 }

@@ -1,0 +1,434 @@
+partial module adm.telemetry.prometheus {
+	use (
+		std.errors
+		std.math
+		std.metrics::(Distribution)
+		std.services::(Application)
+		std.services.telemetry::(MetricSample)
+		std.time
+	)
+
+	// The name and version the library gives itself in `User-Agent`.
+	internal const sdkName = "adm.telemetry.prometheus"
+	internal const sdkVersion = "0.1.0"
+
+	// What kind of failure a PrometheusError is.
+	enum ErrorKind {
+		// The receiver could not be reached or did not answer in time.
+		Unreachable,
+		// The receiver refused the request for good (a 4xx other than 429).
+		Refused,
+		// The receiver asked for a pause (429).
+		RateLimited,
+		// The receiver failed (5xx).
+		ServerError,
+		// A scrape endpoint was asked to listen beyond this machine with no token and no
+		// client certificates, or could not bind its address.
+		Listen,
+	}
+
+	// What the exporters fail with, as the cause of the `ExportFailure` the Telemetry
+	// service receives, and what `Endpoint.start` fails with.
+	struct PrometheusError {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		kind       ErrorKind
+		// The HTTP status of the answer; 0 when there was none.
+		status     int
+		// What the receiver said, "" when it said nothing.
+		serverText string
+		// The pause the receiver asked for; 0s when it asked for none.
+		retryAfter duration
+	}
+
+	// The Telemetry service's histograms: four ranges per doubling, range `at` ending at
+	// 2^((at - 128) / 4); range 0 holds zero, negatives and values up to 2^-32, the top
+	// range everything above 2^64. That is native histogram schema 2, bucket `at - 128`.
+	internal const rangesPerDoubling = 4
+	internal const rangeShift = 128
+	internal const topRange = 385
+	internal const nativeSchema = 2
+
+	// The zero bucket's threshold: range 0 ends at 2^-32.
+	internal const zeroThreshold = 0.00000000023283064365386963
+
+	// The value Prometheus reads as "this series ended": a NaN with this bit pattern.
+	internal const staleBits = uint64(0x7ff0000000000002)
+
+	// One series as the exporters send or serve it, from a metric sample.
+	internal struct Point {
+		// The family name: sanitized, with the unit, without `_total`.
+		family string
+		// `counter`, `gauge` or `histogram`.
+		kind   string
+		help   string
+		// The unit as a Prometheus word (`seconds`, `bytes`), "" without one.
+		unit   string
+		labels map<string, string>
+		// Wall-clock nanoseconds of the reading.
+		time   int64
+		value  float64
+		// A histogram's counts by range (absolute), with sum and number.
+		ranges map<int, uint64>
+		sum    float64
+		count  uint64
+		// The lowest and highest range a histogram's classic buckets cover, kept across
+		// readings so the `le` labels stay the same.
+		low    int
+		high   int
+	}
+
+	// A series' identity: its family and its labels in order of name.
+	internal def keyOf(point Point) string {
+		let names = point.labels.keys()
+		names.sort((a, b) => a < b)
+		let key = point.family
+		for let name in names {
+			let value = point.labels.get(name)
+			key += "\x01{name}={value}" unless value is none
+		}
+		return key
+	}
+
+	// A name as Prometheus takes it: `[a-zA-Z_:][a-zA-Z0-9_:]*`; other characters become
+	// `_`, a leading digit is prefixed with `_`.
+	internal def metricName(name string) string {
+		let out = ""
+		for let c in name {
+			let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c := '_' || ':')
+			out += ok ?? ("{c}", "_")
+		}
+		return "_" when out.isEmpty()
+		return (out[0] >= '0' && out[0] <= '9') ?? ("_" + out, out)
+	}
+
+	// A label name as Prometheus takes it: `[a-zA-Z_][a-zA-Z0-9_]*`, names beginning with
+	// `__` (reserved for Prometheus) prefixed with `key`.
+	internal def labelName(name string) string {
+		let out = ""
+		for let c in name {
+			let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+			out += ok ?? ("{c}", "_")
+		}
+		return "_" when out.isEmpty()
+		out = "_" + out when out[0] >= '0' && out[0] <= '9'
+		return out.startsWith("__") ?? ("key" + out, out)
+	}
+
+	// A unit as the word Prometheus names end with, "" when the unit has none.
+	internal def unitWord(unit string, kind string) string {
+		let cut = unit.indexOf("/")
+		if cut > 0 {
+			let top = unitWord(unit[:cut], kind)
+			let per = perWord(unit[cut + 1:])
+			return "" when top.isEmpty() || per.isEmpty()
+			return "{top}_per_{per}"
+		}
+		switch unit {
+			case "ns":
+				return "nanoseconds"
+			case "us":
+				return "microseconds"
+			case "ms":
+				return "milliseconds"
+			case "s":
+				return "seconds"
+			case "min":
+				return "minutes"
+			case "h":
+				return "hours"
+			case "d":
+				return "days"
+			case "By":
+				return "bytes"
+			case "KiBy":
+				return "kibibytes"
+			case "MiBy":
+				return "mebibytes"
+			case "GiBy":
+				return "gibibytes"
+			case "KBy":
+				return "kilobytes"
+			case "MBy":
+				return "megabytes"
+			case "GBy":
+				return "gigabytes"
+			case "bit":
+				return "bits"
+			case "m":
+				return "meters"
+			case "V":
+				return "volts"
+			case "A":
+				return "amperes"
+			case "J":
+				return "joules"
+			case "W":
+				return "watts"
+			case "g":
+				return "grams"
+			case "Cel":
+				return "celsius"
+			case "Hz":
+				return "hertz"
+			case "%":
+				return "percent"
+			case "1":
+				return kind == "gauge" ?? ("ratio", "")
+			default:
+				return ""
+		}
+	}
+
+	// The denominator of a rate unit: `s` is `second`.
+	internal def perWord(unit string) string {
+		switch unit {
+			case "s":
+				return "second"
+			case "min":
+				return "minute"
+			case "h":
+				return "hour"
+			case "d":
+				return "day"
+			case "w":
+				return "week"
+			case "mo":
+				return "month"
+			case "y":
+				return "year"
+			default:
+				return ""
+		}
+	}
+
+	// The point of a sample with extra labels (job and instance for a pushed series).
+	internal def pointOf(sample MetricSample, extra map<string, string>) ?Point {
+		let kind = sample.kind == "toggle" ?? ("gauge", sample.kind)
+		return none unless kind := "counter" || "gauge" || "histogram"
+		let unit = unitWord(sample.unit, kind)
+		let family = metricName(sample.name)
+		family = family[:family.len() - 6] when kind == "counter" && family.endsWith("_total")
+		family += "_" + unit unless unit.isEmpty() || family.endsWith("_" + unit)
+		let point = Point{family: family, kind: kind, help: sample.description, unit: unit, time: sample.time, value: sample.value}
+		for let (key, value) in sample.labels {
+			let name = labelName(key)
+			let held = point.labels.get(name)
+			// Two names that sanitize alike keep both values, as the OpenTelemetry mapping does.
+			point.labels[name] = held is none ?? (value, held + ";" + value)
+		}
+		for let (key, value) in extra {
+			point.labels[key] = value
+		}
+		point.value = float64(sample.count) when kind == "counter"
+		let spread = sample.distribution
+		if kind == "histogram" && !(spread is none) {
+			point.sum = spread.sum
+			point.count = spread.count
+			point.ranges = rangesOf(spread)
+			point.low = topRange
+			point.high = 0
+			for let (at, _) in point.ranges {
+				point.low = at when at < point.low
+				point.high = at when at > point.high
+			}
+		}
+		return point
+	}
+
+	// A histogram's counts by range: the range of each entry of `counts`, found from the
+	// bound above it, or from the mean when the histogram fills one range.
+	internal def rangesOf(spread Distribution) map<int, uint64> {
+		let out = map<int, uint64>{}
+		return out when spread.counts.len() == 0
+		let first = 0
+		if spread.bounds.len() > 0 {
+			first = int((math.log2(float(spread.bounds[0])) * float(rangesPerDoubling)).round()) + rangeShift
+		} else {
+			first = rangeOfValue(spread.count == 0 ?? (0.0, spread.sum / float64(spread.count)))
+		}
+		for let (i, n) in spread.counts {
+			out[first + i] = n unless n == 0
+		}
+		return out
+	}
+
+	// The range a value falls in, as the Telemetry service's histograms count it.
+	internal def rangeOfValue(value float64) int {
+		return 0 unless value > 0.0
+		let at = int((math.log2(float(value)) * float(rangesPerDoubling)).ceil()) + rangeShift
+		return 0 when at < 0
+		return topRange when at > topRange
+		return at
+	}
+
+	// The upper bound of a range: 2^((at - 128) / 4); +Inf for the top one.
+	internal def upperOf(at int) float64 {
+		return float64(1.0 / 0.0) when at >= topRange
+		return float64(2.0 ** (float(at - rangeShift) / float(rangesPerDoubling)))
+	}
+
+	// One classic bucket: its upper bound and the values at or below it.
+	internal struct Bucket {
+		upper float64
+		total uint64
+	}
+
+	// The classic buckets of a histogram point: the cumulative count at the end of each
+	// range from its lowest to its highest, then +Inf.
+	internal def bucketsOf(point Point) Bucket[] {
+		let out = Bucket[]
+		let total = uint64(0)
+		for let at = point.low; at <= point.high && at < topRange; at++ {
+			let n = point.ranges.get(at)
+			total += n unless n is none
+			out.push(Bucket{upper: upperOf(at), total: total})
+		}
+		out.push(Bucket{upper: float64(1.0 / 0.0), total: point.count})
+		return out
+	}
+
+	// One native histogram span: where it starts relative to the end of the one before,
+	// and how many buckets it has.
+	internal struct Span {
+		offset int
+		length int
+	}
+
+	// The positive buckets of a histogram point as native schema 2 spans and count deltas,
+	// and the count of its zero bucket.
+	internal def nativeOf(point Point) (Span[], int[], uint64) {
+		let spans = Span[]
+		let deltas = int[]
+		let zero = uint64(0)
+		let indexes = int[]
+		for let (at, n) in point.ranges {
+			if at == 0 {
+				zero = n
+				continue
+			}
+			indexes.push(at)
+		}
+		indexes.sort((a, b) => a < b)
+		let previous = 0
+		let nextIndex = 0
+		for let (i, at) in indexes {
+			let index = at - rangeShift
+			let n = point.ranges.get(at)
+			continue when n is none
+			if i == 0 || index != nextIndex {
+				spans.push(Span{offset: i == 0 ?? (index, index - nextIndex), length: 1})
+			} else {
+				spans[spans.len() - 1].length++
+			}
+			deltas.push(int(n) - previous)
+			previous = int(n)
+			nextIndex = index + 1
+		}
+		return (spans, deltas, zero)
+	}
+
+	// The series last read, so a page can show and a push can send every series, and a
+	// series that stopped arriving can end.
+	internal type Store {
+		internal points map<string, Point>
+		internal seen   map<string, int64>
+
+		def new() {}
+
+		// Takes the batch's points; a histogram keeps the widest bucket range it has had.
+		atomic def update(batch Point[]) {
+			let now = wallNow()
+			for let point in batch {
+				let key = keyOf(point)
+				let held = points.get(key)
+				let made = point
+				if !(held is none) && point.kind == "histogram" && held.kind == "histogram" {
+					made.low = held.low when held.low < made.low
+					made.high = held.high when held.high > made.high
+				}
+				points[key] = made
+				seen[key] = now
+			}
+		}
+
+		// The series read within stale of now; those older are taken out and returned
+		// second, for a staleness marker.
+		atomic def live(stale duration) (Point[], Point[]) {
+			let now = wallNow()
+			let fresh = Point[]
+			let ended = Point[]
+			for let (key, point) in points.clone() {
+				let at = seen.get(key)
+				if at is none || now - at > int64(stale) {
+					ended.push(point)
+					points.delete(key)
+					seen.delete(key)
+					continue
+				}
+				fresh.push(point)
+			}
+			return (fresh, ended)
+		}
+	}
+
+	// The resource's labels for `target_info` and pushed series: its attributes but the
+	// service name and instance id, sanitized.
+	internal def resourceLabels(resource map<string, string>) map<string, string> {
+		let out = map<string, string>{}
+		for let (key, value) in resource {
+			continue when key := "service.name" || "app.installation.id" || "service.instance.id"
+			out[labelName(key)] = value
+		}
+		return out
+	}
+
+	// The job of the program: the resource's service name.
+	internal def jobOf(resource map<string, string>, job string) string {
+		return job unless job.isEmpty()
+		let named = resource.get("service.name")
+		return named is none ?? ("adm", named)
+	}
+
+	// The instance of the program: its instance id, else the installation id, else the
+	// session id.
+	internal def instanceOf(resource map<string, string>, instance string) string {
+		return instance unless instance.isEmpty()
+		for let key in ["service.instance.id", "app.installation.id", "session.id"] {
+			let found = resource.get(key)
+			return found unless found is none || found.isEmpty()
+		}
+		return ""
+	}
+
+	// When the program started, in milliseconds: the start of every counter and histogram.
+	internal def startMillis() int64 {
+		return Application.startTime().unixNs() / 1000000
+	}
+
+	// Wall-clock nanoseconds since the Unix epoch, now.
+	internal def wallNow() int64 {
+		return time.wallNs()
+	}
+
+	// A float in the shortest text that reads back as the same value, in `%g` form.
+	internal def shortest(value float64) string {
+		return "NaN" unless value == value
+		return value > 0.0 ?? ("+Inf", "-Inf") when value * 0.0 != 0.0
+		for let digits = 1; digits < 17; digits++ {
+			let text = "%.{digits}g".format(value)
+			return text when parseFloat<float64>(text) == value
+		}
+		return "%.17g".format(value)
+	}
+
+	// A float as OpenMetrics writes `le` and other canonical numbers: `%g`, with `.0` when
+	// it has neither a point nor an exponent.
+	internal def canonical(value float64) string {
+		let text = shortest(value)
+		return text when text.contains(".") || text.contains("e") || text.contains("Inf") || text.contains("NaN")
+		return text + ".0"
+	}
+}

@@ -1,0 +1,394 @@
+partial module adm.telemetry.datadog {
+	use (
+		std.bytes::(Buffer)
+		std.data.compress.gzip
+		std.data.encoding::(JSON, MsgPack, ProtoEncoding, ProtoMessage, Protobuf)
+		std.io
+		std.metrics::(Distribution)
+		std.net.http
+		std.net.http.httptest
+		std.services.logging::(LogLevel, LogRecord)
+		std.services.telemetry::(ErrorReport, ExportFailure, MetricSample, SpanContext, SpanEvent, SpanRecord, TelemetryBatch, UsageEvent)
+		std.testing
+	)
+
+	// An API key and site for the live test, which sends to a real account under the
+	// service `adm-test`.
+	@env("ADM_TEST_DATADOG_KEY")
+	internal const liveKey string
+
+	@env("ADM_TEST_DATADOG_SITE")
+	internal const liveSite string
+
+	// One request the fake intake received.
+	internal struct Received {
+		path     string
+		kind     string
+		encoding string
+		key      string
+		body     byte[]
+	}
+
+	// The Datadog intakes on loopback: keeps every request, answers with the statuses
+	// queued, else 202.
+	internal type FakeIntake {
+		received   Received[]
+		statuses   int[]
+		retryAfter string
+
+		// Serve implements http.Handler.
+		def serve(ctx http.Context) !none {
+			let body = try ctx.bytes()
+			let encoding = ctx.request.headers.get("Content-Encoding")
+			body = try io.readAll(new gzip.Reader(new Buffer(body))) when encoding == "gzip"
+			received.push(Received{path: ctx.request.url.path, kind: ctx.request.headers.get("Content-Type"), encoding: encoding, key: ctx.request.headers.get("DD-API-KEY"), body: body})
+			let status = 202
+			if statuses.len() > 0 {
+				status = statuses[0]
+				statuses = statuses[1:]
+			}
+			ctx.setHeader("Retry-After", retryAfter) unless retryAfter.isEmpty() || status < 300
+			return try ctx.text(status, status < 300 ?? ("\{}", "\{\"errors\":[\"refused by the test\"]}"))
+		}
+
+		// The requests to path, in order.
+		def to(path string) Received[] {
+			return received.filter(r => r.path == path)
+		}
+
+		def paths() string {
+			return received.mapElem(r => r.path).join(",")
+		}
+	}
+
+	internal def started(intake FakeIntake) !(httptest.Server, Exporter) {
+		let server = try httptest.Server.start(intake)
+		let exporter = new Exporter("test-key", site = "datadoghq.eu")
+		exporter.intake = server.url
+		exporter.compress = false
+		exporter.serviceName = ""
+		exporter.env = ""
+		exporter.version = ""
+		exporter.host = "web-1"
+		exporter.tags = ["team:payments"]
+		return (server, exporter)
+	}
+
+	internal def failureOf(exporter Exporter, batch TelemetryBatch) !ExportFailure {
+		exporter.export(batch) onerror (err error) {
+			return err when err is ExportFailure
+			fail "export failed with a plain error: {err.message}"
+		}
+		fail "export did not fail"
+	}
+
+	internal def json(body byte[]) !any {
+		return try (new JSON()).parse(body)
+	}
+
+	internal def objectOf(value any) !map<string, any> {
+		return value when value is map<string, any>
+		fail "not a JSON object"
+	}
+
+	internal def listOf(value any) !any[] {
+		return value when value is any[]
+		fail "not a JSON array"
+	}
+
+	internal def number(value any) float64 {
+		return float64(int(value)) when value is int
+		return float64(value)
+	}
+
+	internal const testTrace = "4bf92f3577b34da6a3ce929d0e0e4736"
+	internal const testResource = {"service.name": "shop", "service.version": "1.4.0", "deployment.environment.name": "prod", "session.id": "run-9", "region": "eu"}
+
+	internal def chargeCard() !none {
+		fail "card declined"
+	}
+
+	internal def declined(at int64, span ?SpanContext = none) ErrorReport {
+		let report = ErrorReport{message: "card declined", code: "E42", kind: "billing.CardError", fields: {"order": 7, "status": "x"}, time: at, span: span}
+		chargeCard() onerror (err error) {
+			report.stack = err.stack
+			recover none
+		}
+		return report
+	}
+
+	internal def span(id string, parent string, name string, start int64, end int64) SpanRecord {
+		return SpanRecord{context: SpanContext{trace: testTrace, span: id, sampled: true}, parent: parent, name: name, start: start, end: end}
+	}
+
+	// The meta (10) or metrics (11) entries of a Span message.
+	internal def entries(message ProtoMessage, field int) !map<string, string> {
+		let out = map<string, string>{}
+		for let entry in message.all(field) {
+			let pair = try entry.asMessage()
+			if field == 10 {
+				out[try pair.get(1).asString()] = try pair.get(2).asString()
+			} else {
+				out[try pair.get(1).asString()] = "{try pair.get(2).asFloat()}"
+			}
+		}
+		return out
+	}
+
+	check "Datadog exporter" {
+		@test()
+		def sitesAndKeys() !none {
+			let eu = new Exporter("k", site = "datadoghq.eu")
+			try testing.expectEqual("datadog datadoghq.eu", eu.name(), "named by its site")
+			let series = new Part("api", "/api/v2/series", "application/json", byte[])
+			try testing.expectEqual("https://api.datadoghq.eu/api/v2/series", intakeURL("", "datadoghq.eu", series), "the API host of the site")
+			try testing.expectEqual("https://http-intake.logs.us5.datadoghq.com/api/v2/logs", intakeURL("", "us5.datadoghq.com", new Part("logs", "/api/v2/logs", "", byte[])), "the logs host")
+			try testing.expectEqual("https://trace.agent.ddog-gov.com/api/v0.2/traces", intakeURL("", "ddog-gov.com", new Part("trace", "/api/v0.2/traces", "", byte[])), "the trace host")
+			try testing.expectEqual("https://proxy.internal:3834/api/v2/logs", intakeURL("https://proxy.internal:3834/", "datadoghq.com", new Part("logs", "/api/v2/logs", "", byte[])), "a proxy keeps the paths")
+			let keyless = new Exporter()
+			keyless.export(TelemetryBatch{events: [UsageEvent{name: "x"}]}) onerror (err error) {
+				fail "a missing key is an ExportFailure" unless err is ExportFailure
+				let failure ExportFailure = err
+				try testing.expectEqual(1, failure.rejected, "that drops the batch")
+				try testing.expectTrue(failure.cause is DatadogError, "with a DatadogError")
+				recover none
+			}
+			try testing.expectEqual("m_9lives", metricName("9lives"), "a name begins with a letter")
+			try testing.expectEqual("http.server_duration", metricName("http.server-duration"), "other characters become _")
+			return none
+		}
+
+		@test()
+		def metricsAsSeriesAndSketches() !none {
+			let intake = new FakeIntake()
+			let (server, exporter) = try started(intake)
+			let first = TelemetryBatch{resource: testResource, metrics: [
+				MetricSample{name: "orders", kind: "counter", time: 10000000000, value: 5.0, count: 5, labels: {"route": "/pay"}},
+				MetricSample{name: "queue.depth", kind: "gauge", time: 10000000000, value: 3.5, unit: "By"},
+				MetricSample{name: "online", kind: "toggle", time: 10000000000, value: 1.0},
+				MetricSample{name: "latency", kind: "histogram", time: 10000000000, value: 1.0, distribution: Distribution{bounds: [], counts: [uint64(4)], sum: 4.0, count: uint64(4)}, unit: "s"},
+			]}
+			try exporter.export(first)
+			try testing.expectEqual("/api/v2/series,/api/beta/sketches", intake.paths(), "series, then sketches")
+			try testing.expectEqual("test-key", intake.received[0].key, "the API key")
+			let series = try listOf((try objectOf(try json(intake.received[0].body)))["series"])
+			try testing.expectEqual(3, series.len(), "counter, gauge, toggle")
+			let orders = try objectOf(series[0])
+			try testing.expectEqual(1, int(orders["type"]), "a count")
+			let points = try listOf(orders["points"])
+			try testing.expectEqual(5.0, number((try objectOf(points[0]))["value"]), "the first total is what was added")
+			try testing.expectEqual(10, int((try objectOf(points[0]))["timestamp"]), "at the reading's second")
+			let tags = (try listOf(orders["tags"])).mapElem(t => "{t}")
+			for let wanted in ["service:shop", "env:prod", "version:1.4.0", "team:payments", "region:eu", "route:/pay"] {
+				try testing.expectTrue(tags.includes(wanted), "tag {wanted}")
+			}
+			try testing.expectFalse(tags.includes("session.id:run-9"), "the session is not a tag")
+			let depth = try objectOf(series[1])
+			try testing.expectEqual(3, int(depth["type"]), "a gauge")
+			try testing.expectEqual("byte", "{depth["unit"]}", "its unit")
+			let resources = try listOf(depth["resources"])
+			try testing.expectEqual("web-1", "{(try objectOf(resources[0]))["name"]}", "the host")
+
+			let sketches = try (new Protobuf()).parse(intake.received[1].body)
+			let sketch = try sketches.get(1).asMessage()
+			try testing.expectEqual("latency", try sketch.get(1).asString(), "the metric")
+			try testing.expectEqual("web-1", try sketch.get(2).asString(), "the host")
+			let dog = try sketch.get(7).asMessage()
+			try testing.expectEqual(4, try dog.get(2).asInt(), "the count")
+			try testing.expectEqual(4.0, try dog.get(6).asFloat(), "the sum")
+			let keys = try dog.get(7).asInts(ProtoEncoding.ZigZag)
+			try testing.expectEqual(1, keys.len(), "one range")
+			try testing.expectEqual(sketchKey(middleOf(128)), keys[0], "the key of the range holding 1")
+			try testing.expectEqual(1338, sketchKey(1.0), "1 is the key of γ^0")
+			try testing.expectEqual(0, sketchKey(0.0), "zero is key 0")
+
+			// The next totals send what was added in between.
+			intake.received = Received[]
+			intake.statuses = [503]
+			let second = TelemetryBatch{resource: testResource, metrics: [
+				MetricSample{name: "orders", kind: "counter", time: 20000000000, value: 12.0, count: 12, labels: {"route": "/pay"}},
+				MetricSample{name: "latency", kind: "histogram", time: 20000000000, distribution: Distribution{bounds: [1.0], counts: [uint64(4), uint64(2)], sum: 6.4, count: uint64(6)}},
+			]}
+			let busy = try failureOf(exporter, second)
+			let rest = busy.rest
+			fail "a busy intake keeps the metrics" when rest is none
+			try testing.expectEqual(2, rest.metrics.len(), "both kept")
+			intake.received = Received[]
+			try exporter.export(rest)
+			let again = try listOf((try objectOf(try json(intake.received[0].body)))["series"])
+			let delta = try objectOf(again[0])
+			try testing.expectEqual(7.0, number((try objectOf((try listOf(delta["points"]))[0]))["value"]), "a batch sent again adds the same difference")
+			try testing.expectEqual(10, int(delta["interval"]), "over the seconds between readings")
+			let grown = try (try (try (new Protobuf()).parse(intake.received[1].body)).get(1).asMessage()).get(7).asMessage()
+			try testing.expectEqual(2, try grown.get(2).asInt(), "the histogram's new values only")
+			try testing.expectTrue((try grown.get(6).asFloat()) > 2.39 && (try grown.get(6).asFloat()) < 2.41, "and their sum")
+			try testing.expectEqual(sketchKey(middleOf(129)), (try grown.get(7).asInts(ProtoEncoding.ZigZag))[0], "in the range above 1")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def logsErrorsAndEvents() !none {
+			let intake = new FakeIntake()
+			let (server, exporter) = try started(intake)
+			let context = SpanContext{trace: testTrace, span: "00f067aa0ba902b7", sampled: true}
+			try exporter.export(TelemetryBatch{
+				resource: testResource,
+				logs:     [LogRecord{level: LogLevel.Warning, message: "card slow", fields: {"ms": 900, "message": "inner"}, time: 2000000000, trace: testTrace, span: "00f067aa0ba902b7"}],
+				errors:   [declined(3000000000, context)],
+				events:   [UsageEvent{name: "checkout.pressed", properties: {"items": 3}, time: 4000000000}],
+			})
+			try testing.expectEqual("/api/v2/logs,/api/v1/events", intake.paths(), "logs, then events")
+			let entries = try listOf(try json(intake.received[0].body))
+			try testing.expectEqual(2, entries.len(), "a record and an error")
+			let slow = try objectOf(entries[0])
+			try testing.expectEqual("warning", "{slow["status"]}", "the status")
+			try testing.expectEqual("adm", "{slow["ddsource"]}", "the source")
+			try testing.expectEqual("shop", "{slow["service"]}", "the service")
+			try testing.expectEqual("web-1", "{slow["hostname"]}", "the host")
+			try testing.expectEqual(2000, int(slow["timestamp"]), "milliseconds")
+			try testing.expectTrue("{slow["ddtags"]}".contains("env:prod"), "the tags")
+			try testing.expectEqual("{0x00f067aa0ba902b7}", "{slow["dd.span_id"]}", "the span in decimal")
+			try testing.expectEqual("inner", "{slow["attributes.message"]}", "a field named like a reserved attribute moves")
+			let error = try objectOf(entries[1])
+			try testing.expectEqual("error", "{error["status"]}", "an error log")
+			try testing.expectEqual("billing.CardError", "{error["error.kind"]}", "its kind")
+			try testing.expectTrue("{error["error.stack"]}".startsWith("  at adm.telemetry.datadog.chargeCard"), "its stack, the failing frame first")
+			let event = try objectOf(try json(intake.received[1].body))
+			try testing.expectEqual("checkout.pressed", "{event["title"]}", "the event's title")
+			try testing.expectEqual(4, int(event["date_happened"]), "its time")
+			try testing.expectEqual("\{\"items\":3}", "{event["text"]}", "its properties")
+
+			let records = LogRecord[]
+			for let i in 0..1500 {
+				records.push(LogRecord{level: LogLevel.Info, message: "record {i}", time: 1})
+			}
+			intake.received = Received[]
+			try exporter.export(TelemetryBatch{logs: records})
+			try testing.expectEqual(2, intake.to("/api/v2/logs").len(), "at most 1000 entries a request")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def tracesAndStats() !none {
+			let intake = new FakeIntake()
+			let (server, exporter) = try started(intake)
+			exporter.sampleRate = 0.5
+			let root = span("1111111111111111", "00f067aa0ba902b7", "checkout", 1000000000, 5000000000)
+			root.parentRemote = true
+			root.attributes = {"http.route": "/pay", "http.response.status_code": 200, "cart": 3}
+			root.events = [SpanEvent{name: "card.read", time: 2000000000}]
+			let charge = span("2222222222222222", "1111111111111111", "charge", 2000000000, 3000000000)
+			let report = declined(2500000000, SpanContext{trace: testTrace, span: "2222222222222222", sampled: true})
+			try exporter.export(TelemetryBatch{resource: testResource, errors: [report]})
+			intake.received = Received[]
+			try exporter.export(TelemetryBatch{resource: testResource, spans: [charge, root]})
+			try testing.expectEqual("/api/v0.2/traces,/api/v0.2/stats", intake.paths(), "traces, then the stats of buckets long done")
+			try testing.expectEqual("application/x-protobuf", intake.received[0].kind, "protobuf traces")
+			let payload = try (new Protobuf()).parse(intake.received[0].body)
+			try testing.expectEqual("web-1", try payload.get(1).asString(), "the host")
+			try testing.expectEqual("prod", try payload.get(2).asString(), "the env")
+			let tracer = try payload.get(5).asMessage()
+			try testing.expectEqual("adm", try tracer.get(2).asString(), "the language")
+			let chunk = try tracer.get(6).asMessage()
+			let spans = chunk.all(3)
+			try testing.expectEqual(2, spans.len(), "one chunk holding the trace")
+			let failed = try spans[0].asMessage()
+			try testing.expectEqual(1, try failed.get(9).asInt(), "the span an error was reported in failed")
+			let failedMeta = try entries(failed, 10)
+			try testing.expectEqual("card declined", failedMeta["error.message"], "with the error")
+			try testing.expectEqual("billing.CardError", failedMeta["error.type"], "and its type")
+			let first = try spans[1].asMessage()
+			try testing.expectEqual("shop", try first.get(1).asString(), "the service")
+			try testing.expectEqual("checkout", try first.get(3).asString(), "the resource")
+			try testing.expectEqual(uint64(0xa3ce929d0e0e4736), try first.get(4).asUint(), "the trace id's low half")
+			try testing.expectEqual(uint64(0x00f067aa0ba902b7), try first.get(6).asUint(), "another program's parent")
+			try testing.expectEqual(4000000000, try first.get(8).asInt(), "the duration")
+			let spanMeta = try entries(first, 10)
+			try testing.expectEqual("4bf92f3577b34da6", spanMeta["_dd.p.tid"], "the trace id's high half")
+			try testing.expectEqual("/pay", spanMeta["http.route"], "a text attribute")
+			try testing.expectTrue(spanMeta["events"].contains("card.read"), "the span events")
+			let metrics = try entries(first, 11)
+			try testing.expectEqual("{1.0}", metrics["_top_level"], "a service entry")
+			try testing.expectEqual("{0.5}", metrics["_sample_rate"], "the sample rate")
+			try testing.expectEqual("{3.0}", metrics["cart"], "a number attribute")
+
+			let stats = try (new MsgPack()).parse(intake.received[1].body)
+			try testing.expectTrue(try stats.get("ClientComputed").asBool(), "stats the client computed")
+			let client = stats.get("Stats").at(0)
+			try testing.expectEqual("shop", try client.get("Service").asString(), "for the service")
+			let bucket = client.get("Stats").at(0)
+			try testing.expectEqual(uint64(0), try bucket.get("Start").asUint(), "the bucket the spans ended in")
+			try testing.expectEqual(uint64(10000000000), try bucket.get("Duration").asUint(), "10 seconds")
+			let grouped = bucket.get("Stats").at(0)
+			try testing.expectEqual("checkout", try grouped.get("Resource").asString(), "the entry span counted")
+			try testing.expectEqual(uint64(2), try grouped.get("Hits").asUint(), "for 1 / sampleRate requests")
+			try testing.expectEqual(uint64(2), try grouped.get("TopLevelHits").asUint(), "as top-level hits")
+			try testing.expectEqual(uint64(200), try grouped.get("HTTPStatusCode").asUint(), "with its status")
+			try testing.expectEqual(2, try grouped.get("IsTraceRoot").asInt(), "not a trace root: its parent is elsewhere")
+			let summary = try (new Protobuf()).parse(try grouped.get("OkSummary").asBytes())
+			let mapping = try summary.get(1).asMessage()
+			try testing.expectTrue((try mapping.get(1).asFloat()) > 1.0202 && (try mapping.get(1).asFloat()) < 1.0203, "the latency sketch's γ for 1% accuracy")
+			let bin = try (try summary.get(2).asMessage()).get(1).asMessage()
+			try testing.expectEqual(summaryIndex(4000000000.0), (try bin.get(1).asInts(ProtoEncoding.ZigZag))[0], "the duration's bin")
+			try testing.expectEqual(2.0, try bin.get(2).asFloat(), "weighted")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def refusalsAndRetries() !none {
+			let intake = new FakeIntake()
+			let (server, exporter) = try started(intake)
+			intake.statuses = [400]
+			let refused = try failureOf(exporter, TelemetryBatch{events: [UsageEvent{name: "a", time: 1}, UsageEvent{name: "b", time: 2}]})
+			try testing.expectEqual(1, refused.rejected, "a 400 drops that event")
+			try testing.expectTrue(refused.message.contains("refused by the test"), "naming what the intake said")
+			try testing.expectEqual(2, intake.to("/api/v1/events").len(), "the next part still goes")
+			intake.statuses = [429]
+			intake.retryAfter = "7"
+			let limited = try failureOf(exporter, TelemetryBatch{events: [UsageEvent{name: "c", time: 3}, UsageEvent{name: "d", time: 4}]})
+			try testing.expectEqual(0, limited.rejected, "a 429 drops nothing")
+			try testing.expectEqual(7s, limited.retryAfter, "and asks for its pause")
+			let rest = limited.rest
+			fail "the rest is kept" when rest is none
+			try testing.expectEqual("c,d", rest.events.mapElem(e => e.name).join(","), "the event it refused and the one not sent")
+			try testing.expectTrue(limited.cause is DatadogError, "with a DatadogError")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def closeSendsOpenStats() !none {
+			let intake = new FakeIntake()
+			let (server, exporter) = try started(intake)
+			let now = wallNow()
+			try exporter.export(TelemetryBatch{spans: [span("1111111111111111", "", "recent", now - 1000, now)]})
+			try testing.expectEqual("/api/v0.2/traces", intake.paths(), "a bucket still open waits")
+			try exporter.close()
+			try testing.expectEqual("/api/v0.2/traces,/api/v0.2/stats", intake.paths(), "close sends it")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def liveAccount() !none {
+			return none when liveKey.isEmpty()
+			let exporter = new Exporter(liveKey, site = liveSite.isEmpty() ?? ("datadoghq.com", liveSite))
+			exporter.serviceName = "adm-test"
+			exporter.env = "adm-test"
+			let now = wallNow()
+			let trace = SpanContext{trace: testTrace, span: "1111111111111111", sampled: true}
+			try exporter.export(TelemetryBatch{
+				metrics: [MetricSample{name: "adm_test.calls", kind: "counter", time: now, value: 1.0, count: 1}, MetricSample{name: "adm_test.latency", kind: "histogram", time: now, distribution: Distribution{bounds: [], counts: [uint64(1)], sum: 0.2, count: uint64(1)}}],
+				logs:    [LogRecord{level: LogLevel.Info, message: "adm-test log", time: now}],
+				errors:  [declined(now, trace)],
+				events:  [UsageEvent{name: "adm-test.event", time: now}],
+				spans:   [SpanRecord{context: trace, name: "adm-test", start: now - 1000000, end: now}],
+			})
+			try exporter.close()
+			return none
+		}
+	}
+}

@@ -1,0 +1,224 @@
+partial module adm.telemetry.datadog {
+	use (
+		std.data.encoding::(JSON)
+		std.services.logging::(LogLevel, LogRecord)
+		std.services.telemetry::(ErrorReport, MetricSample, SpanRecord, TelemetryBatch, UsageEvent)
+	)
+
+	// The most log entries one request carries, the most bytes of JSON, and the longest
+	// message (Datadog's limits are 1000, 5 MB and 1 MB).
+	internal const logsPerRequest = 1000
+	internal const logBytes = 4000000
+	internal const longestMessage = 1000000
+
+	// The log attributes Datadog reserves; a field of one of these names goes as
+	// `attributes.<name>`.
+	internal const reservedLogKeys = ["ddsource", "ddtags", "hostname", "service", "message", "status", "timestamp", "date", "host", "source", "trace_id", "span_id", "dd"]
+
+	// One request: where it goes, what it carries, and the records it was made of, to
+	// keep for another try.
+	internal type Part {
+		// `api`, `logs` or `trace`: which of the site's hosts takes it.
+		hostKind    string
+		path        string
+		contentType string
+		body        byte[]
+		metrics     MetricSample[]
+		logs        LogRecord[]
+		errors      ErrorReport[]
+		events      UsageEvent[]
+		spans       SpanRecord[]
+		// Counter and histogram readings that become the base once the part is delivered.
+		readings    Reading[]
+		counts      ?Deltas                        = none
+		// APM stats buckets that go back to their window when the part is to be sent again.
+		buckets     map<int64, map<string, Group>>
+		window      ?StatsWindow                   = none
+
+		def new(hostKind string, path string, contentType string, body byte[]) {
+			self.hostKind = hostKind
+			self.path = path
+			self.contentType = contentType
+			self.body = body
+		}
+
+		// How many records it holds.
+		def size() int {
+			return metrics.len() + logs.len() + errors.len() + events.len() + spans.len()
+		}
+
+		// Adds its records to rest.
+		def keepIn(rest TelemetryBatch) {
+			rest.metrics = rest.metrics + metrics
+			rest.logs = rest.logs + logs
+			rest.errors = rest.errors + errors
+			rest.events = rest.events + events
+			rest.spans = rest.spans + spans
+			let held = window
+			held.restore(buckets) unless held is none
+		}
+
+		// Called once the intake took it.
+		def delivered() {
+			let held = counts
+			held.commit(readings) unless held is none
+		}
+	}
+
+	// A Datadog log status for a record's level.
+	internal def statusOf(level ?LogLevel) string {
+		return "info" when level is none
+		switch level {
+			case LogLevel.Debug:
+				return "debug"
+			case LogLevel.Warning:
+				return "warning"
+			case LogLevel.Error:
+				return "error"
+			case LogLevel.Fatal:
+				return "critical"
+			default:
+				return "info"
+		}
+	}
+
+	// The low 64 bits of a W3C trace id, or a span id, as the decimal Datadog correlates
+	// logs by; "" for an id that is not hexadecimal.
+	internal def decimalId(hex string) string {
+		return "" unless hex.len() >= 16 && /^[0-9a-f]+$/.test(hex)
+		return "{hex[hex.len() - 16:].toInt<uint64>(16)}"
+	}
+
+	// What every log entry carries.
+	internal def logBase(scope Scope, message string, status string, time int64) map<string, any> {
+		let entry = map<string, any>{
+			"ddsource":  "adm",
+			"ddtags":    scope.tags.join(","),
+			"service":   scope.serviceName,
+			"message":   clip(message, longestMessage),
+			"status":    status,
+			"timestamp": (time == 0 ?? (wallNow(), time)) / 1000000,
+		}
+		entry["hostname"] = scope.host unless scope.host.isEmpty()
+		return entry
+	}
+
+	// Adds fields to entry, under `attributes.` where a name is Datadog's own.
+	internal def addFields(entry map<string, any>, fields map<string, any>) {
+		for let (key, value) in fields {
+			entry[reservedLogKeys.includes(key) ?? ("attributes.{key}", key)] = value
+		}
+	}
+
+	// A log record as a log entry.
+	internal def logEntry(record LogRecord, scope Scope) map<string, any> {
+		let entry = logBase(scope, record.message, statusOf(record.level), record.time)
+		let caller = record.caller
+		entry["logger.name"] = caller.moduleName unless caller.moduleName.isEmpty()
+		entry["logger.method_name"] = caller.name unless caller.name.isEmpty()
+		entry["code.file.path"] = caller.filePath unless caller.filePath.isEmpty()
+		entry["code.line.number"] = caller.line when caller.line > 0
+		entry["dd.trace_id"] = decimalId(record.trace) unless record.trace.isEmpty()
+		entry["dd.span_id"] = decimalId(record.span) unless record.span.isEmpty()
+		addFields(entry, record.fields)
+		return entry
+	}
+
+	// An error report as an error log entry.
+	internal def errorEntry(report ErrorReport, scope Scope) map<string, any> {
+		let entry = logBase(scope, report.message, report.fatal ?? ("critical", "error"), report.time)
+		entry["error.kind"] = report.kind
+		entry["error.message"] = report.message
+		entry["error.code"] = report.code unless report.code.isEmpty()
+		let stack = stackText(report)
+		entry["error.stack"] = stack unless stack.isEmpty()
+		let within = report.span
+		if !(within is none) {
+			entry["dd.trace_id"] = decimalId(within.trace)
+			entry["dd.span_id"] = decimalId(within.span)
+		}
+		addFields(entry, report.fields)
+		return entry
+	}
+
+	// An error's stack, the frame that failed first, one frame a line.
+	internal def stackText(report ErrorReport) string {
+		let lines = string[]
+		let frames = report.stack.frames
+		let index = frames.len() - 1
+		for index >= 0 {
+			let frame = frames[index]
+			let at = frame.location
+			lines.push(at.file.isEmpty() ?? ("  at {frame.name}", "  at {frame.name} ({at.file}:{at.line}:{at.column})"))
+			index--
+		}
+		return lines.join("\n")
+	}
+
+	// One log entry with what it was made of.
+	internal struct LogItem {
+		entry  map<string, any>
+		length int
+		record ?LogRecord       = none
+		report ?ErrorReport     = none
+	}
+
+	// The parts of a batch's log records and error reports, within Datadog's limits.
+	internal def logParts(records LogRecord[], reports ErrorReport[], scope Scope) Part[] {
+		let codec = new JSON()
+		let items = LogItem[]
+		for let record in records {
+			let entry = logEntry(record, scope)
+			items.push(LogItem{entry: entry, length: codec.encode(entry).len(), record: record})
+		}
+		for let report in reports {
+			let entry = errorEntry(report, scope)
+			items.push(LogItem{entry: entry, length: codec.encode(entry).len(), report: report})
+		}
+		let parts = Part[]
+		let from = 0
+		let size = 0
+		for let (at, item) in items {
+			if at > from && (at - from >= logsPerRequest || size + item.length > logBytes) {
+				parts.push(logPart(items[from:at]))
+				from = at
+				size = 0
+			}
+			size += item.length
+		}
+		parts.push(logPart(items[from:])) when items.len() > from
+		return parts
+	}
+
+	internal def logPart(items LogItem[]) Part {
+		let part = new Part("logs", "/api/v2/logs", "application/json", (new JSON()).encode(items.mapElem(item => item.entry)))
+		for let item in items {
+			let record = item.record
+			part.logs.push(record) unless record is none
+			let report = item.report
+			part.errors.push(report) unless report is none
+		}
+		return part
+	}
+
+	// One part per usage event: the events API takes one at a time.
+	internal def eventParts(events UsageEvent[], scope Scope) Part[] {
+		let parts = Part[]
+		let codec = new JSON()
+		for let used in events {
+			let body = map<string, any>{
+				"title":           clip(used.name, 100),
+				"text":            clip(string(codec.encode(used.properties)), 4000),
+				"date_happened":   used.time / 1000000000,
+				"tags":            scope.tags,
+				"alert_type":      "info",
+				"aggregation_key": clip(used.name, 100),
+			}
+			body["host"] = scope.host unless scope.host.isEmpty()
+			let part = new Part("api", "/api/v1/events", "application/json", codec.encode(body))
+			part.events = [used]
+			parts.push(part)
+		}
+		return parts
+	}
+}

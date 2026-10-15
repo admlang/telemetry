@@ -1,0 +1,11 @@
+// StatsD exporter for the Telemetry service
+@manifest(version = "0.1.0")
+library adm.telemetry.statsd {
+	use (
+		adm.telemetry.statsd
+	)
+
+	export (
+		adm.telemetry.statsd
+	)
+}

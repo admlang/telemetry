@@ -1,3 +1,322 @@
 partial module adm.telemetry.datadog {
-	// A std.services.telemetry exporter for Datadog: metrics (series and distributions), logs, events and traces to the intake APIs of a site, with tags, host, service, env and version conventions, batching and retry
+	use (
+		std.bytes::(Buffer)
+		std.data.compress.gzip
+		std.errors
+		std.net.http
+		std.net.tls
+		std.services.runtime::(Runtime)
+		std.services.telemetry::(ExportFailure, TelemetryBatch)
+		std.time
+	)
+
+	// The name and version the exporter gives itself to Datadog.
+	internal const sdkName = "adm.telemetry.datadog"
+	internal const sdkVersion = "0.1.0"
+
+	// The longest pause Datadog is granted.
+	internal const longestPause = 1h
+
+	// What kind of failure a DatadogError is.
+	enum ErrorKind {
+		// No API key: none given and `DD_API_KEY` unset.
+		NoKey,
+		// The intake could not be reached or did not answer in time.
+		Unreachable,
+		// The intake refused the request for good (a 4xx other than 408 and 429).
+		Refused,
+		// The intake asked for a pause (429).
+		RateLimited,
+		// The intake failed (5xx, 408).
+		ServerError,
+	}
+
+	// What the exporter fails with, as the cause of the `ExportFailure` the Telemetry
+	// service receives.
+	struct DatadogError {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		kind       ErrorKind
+		// The HTTP status of the answer; 0 when there was none.
+		status     int
+		// What the intake said, "" when it said nothing.
+		serverText string
+		// The pause the intake asked for; 0s when it asked for none.
+		retryAfter duration
+	}
+
+	// Sends what the Telemetry service collects to a Datadog site, with no agent in
+	// between.
+	//
+	// - Metrics: counters as counts of what was added since the last batch, gauges and
+	//   toggles as gauges (series API); histograms as distributions (the sketch intake the
+	//   agent uses), each range of the service's histogram at its middle value.
+	// - Logs: log records to the logs intake with `status`, `ddsource:adm`, the tags, and
+	//   the trace and span they were written in; error reports as error logs with
+	//   `error.kind`, `error.message` and `error.stack`, and the span they were reported
+	//   in marked as failed.
+	// - Events: usage events as Datadog events.
+	// - Traces: spans to the trace intake, grouped by trace; a span with no parent or with
+	//   a parent in another program is a service entry (`_top_level`). Datadog builds its
+	//   APM request, error and latency metrics from the stats the exporter computes over
+	//   those spans in 10-second buckets, each span counting for `1 / sampleRate`.
+	//
+	// Every record carries the unified service tags: `service`, `env` and `version`
+	// (`DD_SERVICE`, `DD_ENV`, `DD_VERSION`, else the resource's `service.name`,
+	// `deployment.environment.name` and `service.version`), the host (`DD_HOSTNAME`,
+	// else the resource's `host.name`), `tags` with `DD_TAGS`, and the other resource
+	// attributes as tags.
+	//
+	// What the intake could not take (no answer, 408, 429, a 5xx) is kept for another try,
+	// after the pause a 429 asked for; what it refuses for good is dropped. Connecting
+	// needs the `adm.network.connect` permission for the intake hosts.
+	//
+	// ```
+	// let dd = new datadog.Exporter(apiKey, site = "datadoghq.eu")
+	// dd.service = "shop"
+	// ```
+	type Exporter {
+		// The service, environment and version every record names.
+		serviceName string      = ""
+		env         string      = ""
+		version     string      = ""
+		// The host every record names.
+		host        string      = ""
+		// Tags every record carries: `team:payments`.
+		tags        string[]    = []
+		// The share of traces the Telemetry service records (`TelemetryConfig.sampling`):
+		// each span counts for `1 / sampleRate` requests in the APM stats, and the rate goes
+		// with each trace.
+		sampleRate  float64     = 1.0
+		// The base URL every intake is reached at instead of the site's hosts, for a proxy:
+		// `https://proxy.internal:3834`; the paths stay the intakes' own.
+		intake      string      = ""
+		// How long one request may take.
+		timeout     duration    = 10s
+		// Whether request bodies are gzip-compressed.
+		compress    bool        = true
+		// TLS settings for the intakes; none trusts the system's roots. Read when the
+		// first request is sent.
+		tls         ?tls.Config = none
+
+		internal apiKey ?Secret<string> = none
+		internal site   string
+		internal web    ?http.Client    = none
+		internal counts Deltas
+		internal failed FailedSpans
+		internal stats  StatsWindow
+
+		// apiKey is the organization's API key (`DD_API_KEY` when none); site the Datadog
+		// site its account is on: `datadoghq.com` (US1), `us3.datadoghq.com`,
+		// `us5.datadoghq.com`, `datadoghq.eu`, `ap1.datadoghq.com`, `ap2.datadoghq.com` or
+		// `ddog-gov.com` (`DD_SITE`, else US1).
+		def new(apiKey ?Secret<string> = none, site string = "") {
+			let fromEnv = Runtime.getEnv("DD_API_KEY")
+			self.apiKey = apiKey
+			self.apiKey = new Secret<string>(fromEnv) when apiKey is none && !(fromEnv is none)
+			let namedSite = Runtime.getEnv("DD_SITE")
+			self.site = site.isEmpty() ?? (namedSite is none ?? ("datadoghq.com", namedSite), site)
+			serviceName = envOr("DD_SERVICE")
+			env = envOr("DD_ENV")
+			version = envOr("DD_VERSION")
+			host = envOr("DD_HOSTNAME")
+			let named = envOr("DD_TAGS")
+			tags = named.replace(",", " ").split(" ").filter(t => !t.isEmpty())
+			counts = new Deltas()
+			failed = new FailedSpans()
+			stats = new StatsWindow()
+		}
+
+		// Name implements Exporter: `datadog` and the site or intake.
+		def name() string {
+			return "datadog {intake.isEmpty() ?? (site, intake)}"
+		}
+
+		// Export implements Exporter.
+		//
+		// Fails with an ExportFailure when the intakes did not take every record: there is
+		// no API key, an intake cannot be reached or does not answer in time, or answers
+		// with a failure.
+		def export(batch TelemetryBatch) !none {
+			let key = apiKey
+			if key is none {
+				let cause = DatadogError{message: "datadog: no API key: give one or set DD_API_KEY", code: "NoKey", kind: ErrorKind.NoKey}
+				fail ExportFailure{message: cause.message, cause: cause, rejected: batch.metrics.len() + batch.logs.len() + batch.errors.len() + batch.events.len() + batch.spans.len()}
+			}
+			let scope = scopeOf(batch.resource, serviceName, env, version, host, tags)
+			for let report in batch.errors {
+				let within = report.span
+				failed.mark(within.span, report) unless within is none
+			}
+			let parts = Part[]
+			for let part in metricParts(batch.metrics, scope, counts) {
+				parts.push(part)
+			}
+			for let part in logParts(batch.logs, batch.errors, scope) {
+				parts.push(part)
+			}
+			for let part in eventParts(batch.events, scope) {
+				parts.push(part)
+			}
+			for let part in traceParts(batch.spans, scope, sampleRate, failed, stats) {
+				parts.push(part)
+			}
+			let failure = ExportFailure{}
+			let rest = TelemetryBatch{resource: batch.resource}
+			let stopped = false
+			for let part in parts {
+				if stopped {
+					part.keepIn(rest)
+					continue
+				}
+				let outcome = post(key, part)
+				if outcome.again {
+					stopped = true
+					part.keepIn(rest)
+					failure.retryAfter = outcome.wait
+					failure.message = outcome.message
+					failure.cause = outcome.cause
+					continue
+				}
+				if outcome.accepted {
+					part.delivered()
+					continue
+				}
+				failure.rejected += part.size()
+				if failure.message.isEmpty() {
+					failure.message = outcome.message
+					failure.cause = outcome.cause
+				}
+			}
+			return none when failure.message.isEmpty()
+			failure.rest = rest when stopped
+			fail failure
+		}
+
+		// Sends one part and reads how the intake took it.
+		internal def post(key Secret<string>, part Part) Outcome {
+			let url = intakeURL(intake, site, part)
+			let response = request(key, url, part) onerror (err error) {
+				let cause = DatadogError{message: "datadog: {url}: {err.message}", code: "Unreachable", kind: ErrorKind.Unreachable, cause: err}
+				return Outcome{again: true, message: cause.message, cause: cause}
+			}
+			let said = response.text() onerror recover ""
+			return Outcome{accepted: true} when response.status >= 200 && response.status < 300
+			let message = "datadog: {url} answered {response.status}" + (said.trim().isEmpty() ?? ("", ": {clip(said.trim(), 300)}"))
+			let cause = DatadogError{message: message, code: "{response.status}", status: response.status, serverText: said}
+			if (response.status := 408 || 429) || response.status >= 500 {
+				let wait = pauseOf(response.headers.get("Retry-After"))
+				wait = pauseOf(response.headers.get("X-RateLimit-Reset")) when wait == 0s
+				cause.kind = response.status == 429 ?? (ErrorKind.RateLimited, ErrorKind.ServerError)
+				cause.retryAfter = wait
+				return Outcome{again: true, wait: wait, message: message, cause: cause}
+			}
+			cause.kind = ErrorKind.Refused
+			return Outcome{message: message, cause: cause}
+		}
+
+		// Builds and sends one request. Fails when the body cannot be compressed or no
+		// answer arrives in time.
+		internal def request(key Secret<string>, url string, part Part) !http.Response {
+			let payload = part.body
+			if compress {
+				let packed = new Buffer()
+				let packer = new gzip.Writer(packed)
+				try packer.write(part.body)
+				try packer.close()
+				payload = packed.bytes()
+			}
+			let made = try http.newRequest(http.Method.POST, url, payload)
+			made.headers.set("Content-Type", part.contentType)
+			made.headers.set("Content-Encoding", "gzip") when compress
+			made.headers.set("DD-API-KEY", key.reveal())
+			made.headers.set("User-Agent", "{sdkName}/{sdkVersion}")
+			made.headers.set("X-Datadog-Reported-Languages", "adm") when part.hostKind == "trace"
+			return try client().do(made)
+		}
+
+		// The HTTP client, made on first use.
+		internal def client() http.Client {
+			let held = web
+			return held unless held is none
+			let made = new http.Client("", timeout)
+			let secured = tls
+			if !(secured is none) {
+				let transport = new http.Transport()
+				transport.tls = secured
+				made.transport = transport
+			}
+			web = made
+			return made
+		}
+
+		// Close implements Exporter: sends the APM stats of the buckets still open. Does not
+		// fail: stats that cannot be sent now are lost with the exporter.
+		def close() !none {
+			let key = apiKey
+			let open = stats.due(wallNow(), true)
+			if !(key is none) && open.len() > 0 {
+				let scope = scopeOf(map<string, string>{}, serviceName, env, version, host, tags)
+				post(key, statsPart(open, scope, stats))
+			}
+			web = none
+			return none
+		}
+	}
+
+	// How the intake took one part.
+	internal struct Outcome {
+		accepted bool
+		// The records are to be sent again.
+		again    bool
+		// How long the intake asked to wait first.
+		wait     duration
+		message  string
+		cause    ?error   = none
+	}
+
+	// Where a part goes: its path on the `api`, `logs` or `trace` host of site, or on the
+	// proxy at intake.
+	internal def intakeURL(intake string, site string, part Part) string {
+		return intake.trimEnd("/") + part.path unless intake.isEmpty()
+		let hostName = part.hostKind == "logs" ?? ("http-intake.logs.{site}", part.hostKind == "trace" ?? ("trace.agent.{site}", "api.{site}"))
+		return "https://{hostName}{part.path}"
+	}
+
+	// The value of an environment variable, "" when unset.
+	internal def envOr(name string) string {
+		let found = Runtime.getEnv(name)
+		return "" when found is none
+		return found
+	}
+
+	// A pause within what Datadog is granted.
+	internal def bounded(pause duration) duration {
+		return 0s when pause < 0s
+		return pause > longestPause ?? (longestPause, pause)
+	}
+
+	// The pause a `Retry-After` or `X-RateLimit-Reset` header asks for: seconds, or a date
+	// to wait until. 0s when the header is absent or says neither.
+	internal def pauseOf(header string) duration {
+		let text = header.trim()
+		return 0s when text.isEmpty()
+		return bounded(duration(text.toInt<int64>() * 1000000000)) when /^[0-9]{1,9}$/.test(text)
+		let until = time.parseHTTPDate(text) onerror (err error) {
+			return 0s
+		}
+		return bounded(until - time.now())
+	}
+
+	// Wall-clock nanoseconds since the Unix epoch, now.
+	internal def wallNow() int64 {
+		return time.wallNs()
+	}
+
+	// text cut to at most length characters.
+	internal def clip(text string, length int) string {
+		return text.len() > length ?? (text[:length], text)
+	}
 }

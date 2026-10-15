@@ -1,0 +1,337 @@
+partial module adm.telemetry.graylog {
+	use (
+		std.bytes::(Buffer)
+		std.crypto
+		std.data.compress.gzip
+		std.data.compress.zlib
+		std.data.encoding::(JSON)
+		std.errors
+		std.net
+		std.net.http
+		std.net.tls
+		std.services::(Application)
+		std.services.logging::(LogLevel, LogRecord)
+		std.services.policy::(Policy)
+		std.time
+	)
+
+	// What a Writer fails with.
+	struct GraylogError {
+		message string
+		// `TooLarge`, `Refused`, `NotConnected`, `BadAddress`.
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		// The HTTP status of an answer; 0 when there was none.
+		status  int
+	}
+
+	// How UDP messages are compressed.
+	enum Compression {
+		Gzip,
+		Zlib,
+		None,
+	}
+
+	// Writes log records as GELF 1.1 messages (a `LogEncoder` of the Logging service).
+	//
+	// `short_message` is the record's first line, `full_message` the whole message when it
+	// has more; `level` is the syslog severity of the record's level (debug 7, info 6,
+	// warning 4, error 3, fatal 2; a record without a level is notice, 5); `timestamp` the
+	// record's time in seconds with its fraction. The call site goes as `_module`, `_file`,
+	// `_line` and `_function`, the trace and span as `_trace_id` and `_span_id`, and every
+	// field as `_<name>`: numbers stay numbers, other values become text. Names take the
+	// characters GELF allows (letters, digits, `_`, `.`, `-`); `_id`, which Graylog
+	// reserves, goes as `_id_`.
+	//
+	// ```
+	// LogWriterConfig{writer: new graylog.Writer("udp://graylog.internal:12201"), encoder: new graylog.Encoder()}
+	// ```
+	type Encoder {
+		// The source every message names; the application's name when empty.
+		host   string              = ""
+		// Fields every message carries.
+		fields map<string, string> = map<string, string>{}
+
+		def new() {}
+
+		// Encode implements LogEncoder. Does not fail.
+		def encode(record LogRecord) !byte[] {
+			let message = record.message
+			let cut = message.indexOf("\n")
+			let gelf = map<string, any>{
+				"version":       "1.1",
+				"host":          host.isEmpty() ?? (Application.name(), host),
+				"short_message": cut < 0 ?? (message, message[:cut]),
+				"timestamp":     float64(record.time == 0 ?? (wallNow(), record.time)) / 1000000000.0,
+				"level":         severityOf(record.level),
+			}
+			gelf["short_message"] = "-" when "{gelf["short_message"]}".trim().isEmpty()
+			gelf["full_message"] = message when cut >= 0
+			let caller = record.caller
+			gelf["_module"] = caller.moduleName unless caller.moduleName.isEmpty()
+			gelf["_file"] = caller.filePath unless caller.filePath.isEmpty()
+			gelf["_line"] = caller.line when caller.line > 0
+			gelf["_function"] = caller.name unless caller.name.isEmpty()
+			gelf["_trace_id"] = record.trace unless record.trace.isEmpty()
+			gelf["_span_id"] = record.span unless record.span.isEmpty()
+			for let (key, value) in fields {
+				gelf[fieldName(key)] = value
+			}
+			for let (key, value) in record.fields {
+				gelf[fieldName(key)] = valueOf(value)
+			}
+			return (new JSON()).encode(gelf)
+		}
+	}
+
+	// The syslog severity of a level.
+	internal def severityOf(level ?LogLevel) int {
+		return 5 when level is none
+		switch level {
+			case LogLevel.Debug:
+				return 7
+			case LogLevel.Info:
+				return 6
+			case LogLevel.Warning:
+				return 4
+			case LogLevel.Error:
+				return 3
+			default:
+				return 2
+		}
+	}
+
+	// An additional field's name: `_` and the characters GELF allows.
+	internal def fieldName(key string) string {
+		let out = ""
+		for let c in key {
+			let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c := '_' || '.' || '-')
+			out += ok ?? ("{c}", "_")
+		}
+		let name = "_" + out
+		return name == "_id" ?? ("_id_", name)
+	}
+
+	// An additional field's value: a number as itself, anything else as text.
+	internal def valueOf(value any) any {
+		return value when value is int || value is int64 || value is int32 || value is uint || value is uint64 || value is uint32 || value is float || value is float64 || value is float32
+		return value when value is string
+		return value ?? ("true", "false") when value is bool
+		return string((new JSON()).encode(value))
+	}
+
+	// Sends GELF messages to a Graylog input: one encoded record per `write` (what the
+	// Logging service hands a writer).
+	//
+	// - `udp://host:12201`: each message compressed (`compression`) and, when larger than
+	//   `chunkSize`, sent as up to 128 chunks with GELF's chunk header; a message needing
+	//   more fails. A lost datagram goes unnoticed.
+	// - `tcp://host:12201` and `tcp+tls://host:12201`: each message followed by a null
+	//   byte, uncompressed as GELF over TCP requires; a failed write reconnects once.
+	// - `http://host:12201/gelf` and `https://...`: one POST per message, gzip-compressed
+	//   when `compression` is not None.
+	//
+	// Connects on the first message. Connecting needs the `adm.network.connect`
+	// permission for the input.
+	type Writer {
+		// How UDP messages (and HTTP bodies, gzip for any but None) are compressed.
+		compression Compression = Compression.Gzip
+		// The most bytes of one UDP datagram: 1420 fits an Ethernet frame; 8154 suits a
+		// local network that carries larger datagrams.
+		chunkSize   int         = 1420
+		// How long a connect or a write may wait.
+		timeout     duration    = 5s
+		// TLS settings of `tcp+tls://` and `https://`; none verifies the input against the
+		// system's roots.
+		tls         ?tls.Config = none
+
+		internal scheme string
+		internal target string
+		internal url    string
+		internal socket ?net.Socket  = none
+		internal stream ?net.Stream  = none
+		internal web    ?http.Client = none
+
+		// address is `udp://host:port`, `tcp://host:port`, `tcp+tls://host:port` (port 12201
+		// when left out), or an `http://` or `https://` URL of a GELF HTTP input.
+		def new(address string) {
+			let cut = address.indexOf("://")
+			scheme = cut < 0 ?? ("udp", address[:cut])
+			target = cut < 0 ?? (address, address[cut + 3:])
+			url = address
+			target = net.withPort(target, 12201) when scheme := "udp" || "tcp" || "tcp+tls"
+		}
+
+		// Write implements io.Writer: sends one GELF message and returns its length. Fails
+		// when the input cannot be reached, refuses the message, or a UDP message needs
+		// more than 128 chunks.
+		def write(data byte[]) !int {
+			switch scheme {
+				case "udp":
+					try sendDatagrams(data)
+				case "tcp", "tcp+tls":
+					let framed = data + [byte(0)]
+					let failed = false
+					writeAll(try connected(), framed) onerror (err error) {
+						failed = true
+						recover none
+					}
+					if failed {
+						drop()
+						try writeAll(try connected(), framed)
+					}
+				case "http", "https":
+					try post(data)
+				default:
+					fail GraylogError{message: "graylog: {scheme}:// is not udp, tcp, tcp+tls, http or https", code: "BadAddress"}
+			}
+			return data.len()
+		}
+
+		// The message compressed for UDP.
+		internal def packed(data byte[]) !byte[] {
+			return data when compression == Compression.None
+			let out = new Buffer()
+			if compression == Compression.Gzip {
+				let packer = new gzip.Writer(out)
+				try packer.write(data)
+				try packer.close()
+			} else {
+				let packer = new zlib.Writer(out)
+				try packer.write(data)
+				try packer.close()
+			}
+			return out.bytes()
+		}
+
+		// Sends one message as a datagram, or as chunks: `0x1e 0x0f`, an 8-byte message
+		// id, the chunk's number and the count, then its part of the message.
+		internal def sendDatagrams(data byte[]) !none {
+			let body = try packed(data)
+			let open = try datagramSocket()
+			if body.len() <= chunkSize {
+				try open.writeTo(body, target, timeout)
+				return none
+			}
+			let room = chunkSize - 12
+			let count = (body.len() + room - 1) / room
+			fail GraylogError{message: "graylog: a message of {body.len()} bytes needs {count} chunks, at most 128", code: "TooLarge"} when count > 128
+			let id = try crypto.rand(8)
+			for let i = 0; i < count; i++ {
+				let end = (i + 1) * room > body.len() ?? (body.len(), (i + 1) * room)
+				let chunk = [byte(0x1e), byte(0x0f)] + id + [byte(i), byte(count)] + body[i * room:end]
+				try open.writeTo(chunk, target, timeout)
+			}
+			return none
+		}
+
+		internal def datagramSocket() !net.Socket {
+			let held = socket
+			return held unless held is none
+			try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "gelf://" + target)
+			let address = net.parseAddress(target) onerror recover new net.Address()
+			let made = try net.socket(address.isIPv6 ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4), net.SocketType.Datagram)
+			socket = made
+			return made
+		}
+
+		// The stream, connected (and secured for `tcp+tls`) on first use.
+		internal def connected() !net.Stream {
+			let held = stream
+			return held unless held is none
+			try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "gelf://" + target)
+			let conn = try net.dialStream(target, timeout)
+			if scheme == "tcp+tls" {
+				let secured = secureStream(conn, tls, target, timeout) onerror (err error) {
+					conn.close() onerror recover none
+					fail err
+				}
+				stream = secured
+				return secured
+			}
+			stream = conn
+			return conn
+		}
+
+		internal def writeAll(out net.Stream, data byte[]) !none {
+			let at = 0
+			for at < data.len() {
+				let wrote = try out.write(data[at:], timeout)
+				fail GraylogError{message: "graylog: the stream took no bytes", code: "NotConnected"} when wrote <= 0
+				at += wrote
+			}
+			return none
+		}
+
+		// One HTTP request of a message. Fails when the input refuses it.
+		internal def post(data byte[]) !none {
+			let body = data
+			let gzipped = compression != Compression.None
+			if gzipped {
+				let out = new Buffer()
+				let packer = new gzip.Writer(out)
+				try packer.write(data)
+				try packer.close()
+				body = out.bytes()
+			}
+			let made = try http.newRequest(http.Method.POST, url, body)
+			made.headers.set("Content-Type", "application/json")
+			made.headers.set("Content-Encoding", "gzip") when gzipped
+			let response = try client().do(made)
+			response.bytes() onerror recover byte[]
+			fail GraylogError{message: "graylog: {url} answered {response.status}", code: "Refused", status: response.status} unless response.status >= 200 && response.status < 300
+			return none
+		}
+
+		internal def client() http.Client {
+			let held = web
+			return held unless held is none
+			let made = new http.Client("", timeout)
+			let secured = tls
+			if !(secured is none) {
+				let transport = new http.Transport()
+				transport.tls = secured
+				made.transport = transport
+			}
+			web = made
+			return made
+		}
+
+		internal def drop() {
+			let held = stream
+			if !(held is none) {
+				held.close() onerror recover none
+			}
+			stream = none
+			let dgram = socket
+			if !(dgram is none) {
+				dgram.close() onerror recover none
+			}
+			socket = none
+		}
+
+		// Close implements io.Closer: closes the connection. Does not fail.
+		def close() !none {
+			drop()
+			web = none
+			return none
+		}
+	}
+
+	// The TLS client handshake over conn, with settings (a fresh config when none) named
+	// for target's host. Fails as the handshake does.
+	internal def secureStream(conn net.Connection, settings ?tls.Config, target string, timeout duration) !net.Stream {
+		let config = tls.Config{}
+		config = settings unless settings is none
+		config = tls.withServerName(config, (net.parseAddress(target) onerror recover new net.Address()).host) when config.serverName == ""
+		let secured = tls.client(conn, config)
+		try secured.handshake(timeout)
+		return secured
+	}
+
+	// Wall-clock nanoseconds since the Unix epoch, now.
+	internal def wallNow() int64 {
+		return time.wallNs()
+	}
+}

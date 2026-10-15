@@ -1,0 +1,364 @@
+partial module adm.telemetry.datadog {
+	use (
+		std.data.encoding::(JSON, ProtoEncoding, ProtoWriter)
+		std.math
+		std.metrics::(Distribution)
+		std.services.telemetry::(MetricSample)
+	)
+
+	// The most series one series request carries, and the most bytes of JSON.
+	internal const seriesPerRequest = 1000
+	internal const seriesBytes = 2000000
+
+	// The Telemetry service's histograms: four ranges per doubling, range `at` ending at
+	// 2^((at - 128) / 4); range 0 holds zero, negatives and values below 2^-32.
+	internal const rangesPerDoubling = 4
+	internal const rangeShift = 128
+	internal const topRange = 385
+
+	// The agent's sketch keys: γ = 1 + 2/128, values below 1e-9 counted as zero, keys
+	// up to 32766 (`pkg/util/quantile` of the Datadog agent).
+	internal const sketchGamma = 1.015625
+	internal const sketchMinValue = 0.000000001
+	internal const sketchMaxKey = 32766
+
+	// What every record of a batch names: the unified service tags and the rest of the
+	// tags.
+	internal struct Scope {
+		serviceName string
+		env         string
+		version     string
+		host        string
+		// `key:value` tags: service, env, version, the exporter's, and the resource's
+		// other attributes.
+		tags        string[]
+		// The resource's session id, the runtime id of traces and stats.
+		session     string
+	}
+
+	// The resource attributes that are not tags of their own.
+	internal const resourceKeys = ["service.name", "service.version", "host.name", "deployment.environment", "deployment.environment.name", "session.id"]
+
+	internal def scopeOf(resource map<string, string>, serviceName string, env string, version string, host string, tags string[]) Scope {
+		let made = Scope{serviceName: serviceName, env: env, version: version, host: host, session: entryOf(resource, "session.id")}
+		made.serviceName = entryOf(resource, "service.name", "adm") when made.serviceName.isEmpty()
+		made.env = entryOf(resource, "deployment.environment.name", entryOf(resource, "deployment.environment")) when made.env.isEmpty()
+		made.version = entryOf(resource, "service.version") when made.version.isEmpty()
+		made.host = entryOf(resource, "host.name") when made.host.isEmpty()
+		made.tags.push(tagOf("service", made.serviceName))
+		made.tags.push(tagOf("env", made.env)) unless made.env.isEmpty()
+		made.tags.push(tagOf("version", made.version)) unless made.version.isEmpty()
+		for let tag in tags {
+			made.tags.push(clip(tag, 200))
+		}
+		for let (key, value) in resource {
+			made.tags.push(tagOf(key, value)) unless resourceKeys.includes(key) || value.isEmpty()
+		}
+		return made
+	}
+
+	// A `key:value` tag within Datadog's 200 characters.
+	internal def tagOf(key string, value string) string {
+		return clip("{key}:{value}", 200)
+	}
+
+	// The entry of key, fallback when there is none.
+	internal def entryOf(entries map<string, string>, key string, fallback string = "") string {
+		let found = entries.get(key)
+		return fallback when found is none
+		return found
+	}
+
+	// A metric name as Datadog takes it: ASCII letters, digits, `_` and `.`, beginning
+	// with a letter, at most 200 characters.
+	internal def metricName(name string) string {
+		let out = ""
+		for let c in name {
+			let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || (c := '_' || '.')
+			out += ok ?? ("{c}", "_")
+		}
+		let first = out.isEmpty() ?? ('_', out[0])
+		out = "m_" + out unless (first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')
+		return clip(out, 200)
+	}
+
+	// A metric's unit as Datadog names it, "" when Datadog has no name for it.
+	internal def unitName(unit string) string {
+		switch unit {
+			case "ns":
+				return "nanosecond"
+			case "us":
+				return "microsecond"
+			case "ms":
+				return "millisecond"
+			case "s":
+				return "second"
+			case "min":
+				return "minute"
+			case "h":
+				return "hour"
+			case "By":
+				return "byte"
+			case "KiBy":
+				return "kibibyte"
+			case "MiBy":
+				return "mebibyte"
+			case "GiBy":
+				return "gibibyte"
+			case "bit":
+				return "bit"
+			case "%":
+				return "percent"
+			case "Hz":
+				return "hertz"
+			default:
+				return ""
+		}
+	}
+
+	// One series' reading as last delivered: a counter's total, or a histogram's counts by
+	// range with their sum and number, and when it was read.
+	internal struct Reading {
+		key    string
+		time   int64
+		count  uint64
+		ranges map<int, uint64>
+		sum    float64
+	}
+
+	// What counters and histograms stood at when last delivered. The Telemetry service
+	// reports totals since the program started; Datadog takes what was added in between.
+	// A reading becomes the base only once its request was delivered, so a batch sent
+	// again computes the same differences.
+	internal type Deltas {
+		internal held map<string, Reading>
+
+		def new() {}
+
+		// The reading last delivered for key, none before the first.
+		atomic def last(key string) ?Reading {
+			return held.get(key)
+		}
+
+		// Makes readings the base of the next differences.
+		atomic def commit(readings Reading[]) {
+			for let reading in readings {
+				let before = held.get(reading.key)
+				held[reading.key] = reading when before is none || before.time <= reading.time
+			}
+		}
+	}
+
+	// A series' identity: its name and its labels in order of name.
+	internal def seriesKey(sample MetricSample) string {
+		let names = sample.labels.keys()
+		names.sort((a, b) => a < b)
+		let key = sample.name
+		for let name in names {
+			let value = sample.labels.get(name)
+			key += "\x01{name}={value}" unless value is none
+		}
+		return key
+	}
+
+	// The tags of a series: the batch's and its labels.
+	internal def seriesTags(sample MetricSample, scope Scope) string[] {
+		let out = scope.tags.clone()
+		for let (key, value) in sample.labels {
+			out.push(tagOf(key, value))
+		}
+		return out
+	}
+
+	// The parts of a batch's metrics: series requests for counters, gauges and toggles,
+	// one sketch request for histograms.
+	internal def metricParts(samples MetricSample[], scope Scope, counts Deltas) Part[] {
+		let parts = Part[]
+		let series = any[]
+		let held = MetricSample[]
+		let readings = Reading[]
+		let size = 0
+		let sketches = new ProtoWriter()
+		let sketched = MetricSample[]
+		let sketchReadings = Reading[]
+		let sketchCount = 0
+		for let sample in samples {
+			let seconds = sample.time / 1000000000
+			if sample.kind == "histogram" {
+				let spread = sample.distribution
+				continue when spread is none
+				let reading = rangesOf(seriesKey(sample), sample.time, spread)
+				let previous = counts.last(reading.key)
+				let delta = deltaOf(reading, previous)
+				sketched.push(sample)
+				sketchReadings.push(reading)
+				continue when delta.count == 0
+				sketches.write(1, sketchOf(metricName(sample.name), scope.host, seriesTags(sample, scope), seconds, delta))
+				sketchCount++
+				continue
+			}
+			let entry = map<string, any>{
+				"metric":    metricName(sample.name),
+				"tags":      seriesTags(sample, scope),
+				"resources": scope.host.isEmpty() ?? (any[], [{"name": scope.host, "type": "host"}]),
+			}
+			let unit = unitName(sample.unit)
+			entry["unit"] = unit unless unit.isEmpty()
+			if sample.kind == "counter" {
+				let reading = Reading{key: seriesKey(sample), time: sample.time, count: sample.count}
+				let previous = counts.last(reading.key)
+				let added = reading.count
+				if !(previous is none) && previous.count <= reading.count {
+					added = reading.count - previous.count
+					let interval = (reading.time - previous.time) / 1000000000
+					entry["interval"] = interval when interval > 0
+				}
+				entry["type"] = 1
+				entry["points"] = [{"timestamp": seconds, "value": float64(added)}]
+				readings.push(reading)
+			} else {
+				entry["type"] = 3
+				entry["points"] = [{"timestamp": seconds, "value": sample.value}]
+			}
+			let encoded = (new JSON()).encode(entry)
+			if series.len() > 0 && (series.len() >= seriesPerRequest || size + encoded.len() > seriesBytes) {
+				parts.push(seriesPart(series, held, readings, counts))
+				series = any[]
+				held = MetricSample[]
+				readings = Reading[]
+				size = 0
+			}
+			series.push(entry)
+			held.push(sample)
+			size += encoded.len()
+		}
+		parts.push(seriesPart(series, held, readings, counts)) when series.len() > 0
+		if sketchCount > 0 {
+			// SketchPayload: the sketches, then the (empty) common metadata.
+			sketches.write(2, new ProtoWriter())
+			let part = new Part("api", "/api/beta/sketches", "application/x-protobuf", sketches.bytes())
+			part.metrics = sketched
+			part.readings = sketchReadings
+			part.counts = counts
+			parts.push(part)
+		} else if sketched.len() > 0 {
+			// Histograms that took nothing new still move their base.
+			counts.commit(sketchReadings)
+		}
+		return parts
+	}
+
+	internal def seriesPart(series any[], samples MetricSample[], readings Reading[], counts Deltas) Part {
+		let part = new Part("api", "/api/v2/series", "application/json", (new JSON()).encode({"series": series}))
+		part.metrics = samples
+		part.readings = readings
+		part.counts = counts
+		return part
+	}
+
+	// A histogram's counts by range: the range of each entry of `counts`, found from the
+	// bound above it, or from the mean when the histogram fills one range.
+	internal def rangesOf(key string, time int64, spread Distribution) Reading {
+		let reading = Reading{key: key, time: time, count: spread.count, sum: spread.sum}
+		return reading when spread.counts.len() == 0
+		let first = 0
+		if spread.bounds.len() > 0 {
+			first = rangeOfBound(spread.bounds[0])
+		} else {
+			first = rangeOfValue(spread.count == 0 ?? (0.0, spread.sum / float64(spread.count)))
+		}
+		for let (i, n) in spread.counts {
+			reading.ranges[first + i] = n unless n == 0
+		}
+		return reading
+	}
+
+	// The range a bound ends: 2^((at - 128) / 4) for range at.
+	internal def rangeOfBound(bound float64) int {
+		return int((math.log2(float(bound)) * float(rangesPerDoubling)).round()) + rangeShift
+	}
+
+	// The range a value falls in, as the Telemetry service's histograms count it.
+	internal def rangeOfValue(value float64) int {
+		return 0 unless value > 0.0
+		let at = int((math.log2(float(value)) * float(rangesPerDoubling)).ceil()) + rangeShift
+		return 0 when at < 0
+		return topRange when at > topRange
+		return at
+	}
+
+	// What was added to a histogram since previous: by range, with sum and number; all of
+	// it when there is no previous reading or the histogram started over.
+	internal def deltaOf(reading Reading, previous ?Reading) Reading {
+		return reading when previous is none || previous.count > reading.count
+		let delta = Reading{key: reading.key, time: reading.time, count: reading.count - previous.count, sum: reading.sum - previous.sum}
+		for let (at, n) in reading.ranges {
+			let before = previous.ranges.get(at)
+			let added = before is none ?? (n, n - before)
+			delta.ranges[at] = added when added > 0 && (before is none || n > before)
+		}
+		return delta
+	}
+
+	// The middle of a range on a log scale; 0 for range 0, its bound for the top one.
+	internal def middleOf(at int) float64 {
+		return 0.0 when at <= 0
+		return float64(2.0 ** (float(at - rangeShift) / float(rangesPerDoubling))) when at >= topRange
+		return float64(2.0 ** ((float(at - rangeShift) - 0.5) / float(rangesPerDoubling)))
+	}
+
+	// The agent sketch key of a positive value: the nearest power of γ, offset so the
+	// smallest value counted is key 1; 0 for zero and values too small to count.
+	internal def sketchKey(value float64) int {
+		let lnGamma = math.ln(float(sketchGamma))
+		let bias = 1 - int((math.ln(float(sketchMinValue)) / lnGamma).floor())
+		return 0 unless value > 0.0
+		let exact = math.ln(float(value)) / lnGamma
+		let below = exact.floor()
+		let nearest = int(below)
+		// Halves go to the even key, as the agent rounds.
+		nearest = int(below) + 1 when exact - below > 0.5 || (exact - below == 0.5 && int(below) % 2 != 0)
+		let key = nearest + bias
+		return 0 when key < 1
+		return key > sketchMaxKey ?? (sketchMaxKey, key)
+	}
+
+	// One Sketch of a SketchPayload holding one Dogsketch of delta.
+	internal def sketchOf(metric string, host string, tags string[], seconds int64, delta Reading) ProtoWriter {
+		let ranges = delta.ranges.keys()
+		ranges.sort((a, b) => a < b)
+		let keys = map<int, uint64>{}
+		for let at in ranges {
+			let added = delta.ranges.get(at)
+			continue when added is none
+			let key = sketchKey(middleOf(at))
+			keys[key] = (keys.hasKey(key) ?? (keys[key], uint64(0))) + added
+		}
+		let ordered = keys.keys()
+		ordered.sort((a, b) => a < b)
+		let tallies = uint32[]
+		for let key in ordered {
+			let tally = keys.get(key)
+			continue when tally is none
+			// A key holds at most 2^32 - 1 values in one reading, as the payload counts them.
+			tallies.push(uint32(tally > uint64(4294967295) ?? (uint64(4294967295), tally)))
+		}
+		let sketch = new ProtoWriter()
+		sketch.write(1, int(seconds))
+		sketch.write(2, int(delta.count))
+		sketch.write(3, float(ranges.len() == 0 ?? (0.0, middleOf(ranges[0]))))
+		sketch.write(4, float(ranges.len() == 0 ?? (0.0, middleOf(ranges[ranges.len() - 1]))))
+		sketch.write(5, float(delta.count == 0 ?? (0.0, delta.sum / float64(delta.count))))
+		sketch.write(6, float(delta.sum))
+		sketch.writePacked(7, ordered.mapElem(k => int32(k)), ProtoEncoding.ZigZag)
+		sketch.writePacked(8, tallies)
+		let entry = new ProtoWriter()
+		entry.write(1, metric)
+		entry.write(2, host) unless host.isEmpty()
+		for let tag in tags {
+			entry.write(4, tag)
+		}
+		entry.write(7, sketch)
+		return entry
+	}
+}

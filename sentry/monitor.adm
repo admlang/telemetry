@@ -1,0 +1,160 @@
+partial module adm.telemetry.sentry {
+	use (
+		std.crypto
+		std.services.telemetry::(Telemetry)
+	)
+
+	// A scheduled job Sentry watches: each run is reported as check-ins, and Sentry raises
+	// an issue when a run fails, runs too long, or does not happen on schedule.
+	//
+	// With `crontab` or `interval` set, every check-in also creates or updates the monitor
+	// in Sentry with the schedule and the settings below; without either the monitor has
+	// to exist in Sentry already.
+	//
+	// A check-in that does not arrive never fails the job: Sentry then sees a missed or
+	// timed-out run, which is what the monitor is for.
+	//
+	// ```
+	// let nightly = st.monitor("nightly-import")
+	// nightly.crontab = "0 3 * * *"
+	// try nightly.run(importOrders)
+	// ```
+	type Monitor {
+		// The monitor's slug in Sentry.
+		slug              string
+		// The schedule as a crontab line, `0 3 * * *`.
+		crontab           string   = ""
+		// The schedule as a period, when it is not a crontab line: whole minutes, sent in
+		// the largest unit that divides it (minutes, hours, days, weeks).
+		interval          duration = 0s
+		// The time zone of `crontab`, `Europe/London`; UTC when empty.
+		timezone          string   = ""
+		// How late a run may begin before Sentry counts it missed; Sentry's default when 0.
+		margin            duration = 0s
+		// How long a run may take before Sentry counts it timed out; Sentry's default
+		// when 0. At most 7 days.
+		maxRuntime        duration = 0s
+		// Failed runs in a row before Sentry raises an issue, and good runs in a row before
+		// it resolves it; Sentry's defaults when 0.
+		failureThreshold  int      = 0
+		recoveryThreshold int      = 0
+
+		internal exporter Exporter
+
+		def new(exporter Exporter, slug string) {
+			self.exporter = exporter
+			self.slug = slug
+		}
+
+		// Reports that a run began, on a task of its own so the job does not wait for
+		// Sentry, and returns the run to report its end on.
+		def start() CheckIn {
+			let id = (new crypto.UUID()).str()
+			let started = wallNow()
+			return new CheckIn(self, id, started, exporter.checkInLater(payload(id, started, "in_progress")))
+		}
+
+		// Runs job between a check-in that it began and one that it ended well or failed.
+		// Fails with job's error.
+		def run(job def () !none) !none {
+			let current = start()
+			job() onerror (err error) {
+				current.error()
+				fail err
+			}
+			current.ok()
+			return none
+		}
+
+		// The check-in payload of the run id that started at started (wall-clock
+		// nanoseconds), with status: what `CheckIn` sends.
+		def payload(id string, started int64, status string) map<string, any> {
+			let made = map<string, any>{
+				"check_in_id":  id,
+				"monitor_slug": slug,
+				"status":       status,
+			}
+			made["duration"] = seconds(wallNow() - started) unless status == "in_progress"
+			made["release"] = exporter.release unless exporter.release.isEmpty()
+			made["environment"] = exporter.environment unless exporter.environment.isEmpty()
+			let within = Telemetry.current()
+			made["contexts"] = {"trace": {"trace_id": within.context().trace}} unless within is none
+			let config = configuration()
+			made["monitor_config"] = config unless config is none
+			return made
+		}
+
+		// The monitor's configuration, none without a schedule.
+		internal def configuration() ?map<string, any> {
+			let schedule = map<string, any>{}
+			if !crontab.isEmpty() {
+				schedule = {"type": "crontab", "value": crontab}
+			} else if interval > 0s {
+				schedule = periodOf(interval)
+			} else {
+				return none
+			}
+			let config = map<string, any>{"schedule": schedule}
+			config["timezone"] = timezone unless timezone.isEmpty()
+			config["checkin_margin"] = minutesOf(margin) when margin > 0s
+			config["max_runtime"] = minutesOf(maxRuntime) when maxRuntime > 0s
+			config["failure_issue_threshold"] = failureThreshold when failureThreshold > 0
+			config["recovery_threshold"] = recoveryThreshold when recoveryThreshold > 0
+			return config
+		}
+	}
+
+	// One run of a monitored job.
+	type CheckIn {
+		internal monitor Monitor
+		internal id      string
+		internal started int64
+		internal closed  bool
+		// The check-in that the run began, on its way.
+		internal opened  async bool
+
+		def new(monitor Monitor, id string, started int64, opened async bool) {
+			self.monitor = monitor
+			self.id = id
+			self.started = started
+			self.opened = opened
+		}
+
+		// Reports that the run ended well, with how long it took. A second report of the
+		// run does nothing.
+		def ok() {
+			end("ok")
+		}
+
+		// Reports that the run failed, with how long it took. A second report of the run
+		// does nothing.
+		def error() {
+			end("error")
+		}
+
+		// Sends the run's last check-in once the first one went, so Sentry sees them in
+		// order.
+		internal def end(status string) {
+			return when closed
+			closed = true
+			await opened
+			monitor.exporter.checkIn(monitor.payload(id, started, status))
+		}
+	}
+
+	// A period as a Sentry interval schedule, in the largest unit that divides it.
+	internal def periodOf(period duration) map<string, any> {
+		let minutes = minutesOf(period)
+		return {"type": "interval", "value": minutes / 10080, "unit": "week"} when minutes % 10080 == 0
+		return {"type": "interval", "value": minutes / 1440, "unit": "day"} when minutes % 1440 == 0
+		return {"type": "interval", "value": minutes / 60, "unit": "hour"} when minutes % 60 == 0
+		return {"type": "interval", "value": minutes, "unit": "minute"}
+	}
+
+	// A duration in whole minutes, rounded up.
+	internal def minutesOf(span duration) int {
+		let ns = int64(span)
+		let minute = int64(60) * 1000000000
+		return int((ns + minute - 1) / minute)
+	}
+}

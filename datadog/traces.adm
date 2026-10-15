@@ -1,0 +1,467 @@
+partial module adm.telemetry.datadog {
+	use (
+		std.data.encoding::(JSON, MsgPack, MsgPackKind, MsgPackValue, ProtoEncoding, ProtoWriter)
+		std.math
+		std.services.telemetry::(ErrorReport, SpanRecord)
+	)
+
+	// The most bytes of spans one trace request carries (Datadog takes 3.2 MB).
+	internal const traceBytes = 3000000
+
+	// The span of APM stats buckets, and how long a bucket stays open after it ends for
+	// spans that arrive late.
+	internal const bucketSpan = int64(10000000000)
+	internal const bucketGrace = int64(20000000000)
+
+	// How long an error report waits for the span it was reported in.
+	internal const errorWait = int64(600000000000)
+
+	// The relative accuracy of the latency sketches in APM stats, as the agent keeps them.
+	internal const summaryAccuracy = 0.01
+
+	// Error reports by the span they were reported in, until that span is exported: the
+	// span then goes as failed, with the error.
+	internal type FailedSpans {
+		internal reports map<string, ErrorReport>
+		internal since   map<string, int64>
+
+		def new() {}
+
+		atomic def mark(span string, report ErrorReport) {
+			let now = wallNow()
+			reports[span] = report
+			since[span] = now
+			for let (id, at) in since.clone() {
+				continue unless now - at > errorWait
+				reports.delete(id)
+				since.delete(id)
+			}
+		}
+
+		// The report of span, taken; none when there is none.
+		atomic def take(span string) ?ErrorReport {
+			let found = reports.get(span)
+			reports.delete(span)
+			since.delete(span)
+			return found
+		}
+	}
+
+	// One span as APM stats count it.
+	internal struct Hit {
+		serviceName string
+		name        string
+		resource    string
+		kind        string
+		spanKind    string
+		status      uint32
+		method      string
+		endpoint    string
+		root        bool
+		topLevel    bool
+		failed      bool
+		duration    int64
+		end         int64
+	}
+
+	// The figures of one aggregation key in one bucket.
+	internal type Group {
+		hit      Hit
+		hits     float64
+		errors   float64
+		topLevel float64
+		duration float64
+		ok       map<int, float64>
+		okZero   float64
+		bad      map<int, float64>
+		badZero  float64
+
+		def new(hit Hit) {
+			self.hit = hit
+		}
+
+		def add(hit Hit, weight float64) {
+			hits += weight
+			topLevel += weight when hit.topLevel
+			duration += float64(hit.duration) * weight
+			errors += weight when hit.failed
+			let value = float64(hit.duration)
+			if value <= 0.0 {
+				okZero += weight unless hit.failed
+				badZero += weight when hit.failed
+				return
+			}
+			let index = summaryIndex(value)
+			if hit.failed {
+				bad[index] = (bad.hasKey(index) ?? (bad[index], 0.0)) + weight
+			} else {
+				ok[index] = (ok.hasKey(index) ?? (ok[index], 0.0)) + weight
+			}
+		}
+	}
+
+	// The APM stats of spans exported lately, in 10-second buckets by the time each span
+	// ended; a bucket goes once it is 20 seconds past its end, or at close.
+	internal type StatsWindow {
+		internal buckets  map<int64, map<string, Group>>
+		internal sequence uint64
+
+		def new() {}
+
+		atomic def add(hit Hit, weight float64) {
+			let start = hit.end - hit.end % bucketSpan
+			let groups = buckets.get(start)
+			buckets[start] = map<string, Group>{} when groups is none
+			let key = "{hit.serviceName}\x01{hit.name}\x01{hit.resource}\x01{hit.kind}\x01{hit.spanKind}\x01{hit.status}\x01{hit.method}\x01{hit.endpoint}\x01{hit.root}"
+			let held = buckets[start]
+			held[key] = new Group(hit) unless held.hasKey(key)
+			held[key].add(hit, weight)
+		}
+
+		// The buckets that are done by now (all of them with everything), taken out.
+		atomic def due(now int64, everything bool) map<int64, map<string, Group>> {
+			let out = map<int64, map<string, Group>>{}
+			for let (start, groups) in buckets.clone() {
+				continue unless everything || start + bucketSpan + bucketGrace <= now
+				out[start] = groups
+				buckets.delete(start)
+			}
+			return out
+		}
+
+		// Puts buckets that were not delivered back.
+		atomic def restore(taken map<int64, map<string, Group>>) {
+			for let (start, groups) in taken {
+				let held = buckets.get(start)
+				if held is none {
+					buckets[start] = groups
+					continue
+				}
+				for let (key, group) in groups {
+					if !held.hasKey(key) {
+						held[key] = group
+						continue
+					}
+					let mine = held[key]
+					mine.hits += group.hits
+					mine.errors += group.errors
+					mine.topLevel += group.topLevel
+					mine.duration += group.duration
+					mine.okZero += group.okZero
+					mine.badZero += group.badZero
+					for let (index, count) in group.ok {
+						mine.ok[index] = (mine.ok.hasKey(index) ?? (mine.ok[index], 0.0)) + count
+					}
+					for let (index, count) in group.bad {
+						mine.bad[index] = (mine.bad.hasKey(index) ?? (mine.bad[index], 0.0)) + count
+					}
+				}
+			}
+		}
+
+		atomic def next() uint64 {
+			sequence++
+			return sequence
+		}
+	}
+
+	// The index of a positive value in the latency sketches: ⌊ln(v) / ln(γ)⌋ with
+	// γ = (1 + α) / (1 - α), the logarithmic mapping of DDSketch with no offset.
+	internal def summaryIndex(value float64) int {
+		let gamma = (1.0 + summaryAccuracy) / (1.0 - summaryAccuracy)
+		return int((math.ln(float(value)) / math.ln(float(gamma))).floor())
+	}
+
+	// A DDSketch message of counts by index and the count at zero.
+	internal def summaryOf(counts map<int, float64>, zero float64) byte[] {
+		let gamma = (1.0 + summaryAccuracy) / (1.0 - summaryAccuracy)
+		let mapping = new ProtoWriter()
+		mapping.write(1, float(gamma))
+		mapping.write(2, float(0.0))
+		mapping.write(3, 0)
+		let store = new ProtoWriter()
+		for let (index, count) in counts {
+			let bin = new ProtoWriter()
+			bin.write(1, int32(index), ProtoEncoding.ZigZag)
+			bin.write(2, float(count))
+			store.write(1, bin)
+		}
+		let sketch = new ProtoWriter()
+		sketch.write(1, mapping)
+		sketch.write(2, store)
+		sketch.write(3, new ProtoWriter())
+		sketch.write(4, float(zero))
+		return sketch.bytes()
+	}
+
+	// A span attribute read as text, "" when absent.
+	internal def attributeText(span SpanRecord, key string) string {
+		let value = span.attributes.get(key)
+		return "" when value is none
+		return "{value}"
+	}
+
+	// Whether a span begins a unit of work in this program.
+	internal def entersService(span SpanRecord) bool {
+		return span.parent.isEmpty() || span.parentRemote
+	}
+
+	// The parts of a batch's spans: the traces, and the APM stats of the buckets that are
+	// done.
+	internal def traceParts(spans SpanRecord[], scope Scope, sampleRate float64, failed FailedSpans, stats StatsWindow) Part[] {
+		let parts = Part[]
+		let weight = sampleRate > 0.0 && sampleRate < 1.0 ?? (1.0 / sampleRate, 1.0)
+		let order = string[]
+		let traces = map<string, SpanRecord[]>{}
+		for let span in spans {
+			let trace = span.context.trace
+			if !traces.hasKey(trace) {
+				traces[trace] = SpanRecord[]
+				order.push(trace)
+			}
+			traces[trace].push(span)
+		}
+		let chunks = ProtoWriter[]
+		let held = SpanRecord[]
+		let size = 0
+		for let trace in order {
+			let chunk = new ProtoWriter()
+			chunk.write(1, int32(1))
+			for let span in traces[trace] {
+				let report = failed.take(span.context.span)
+				let encoded = spanOf(span, scope, sampleRate, report)
+				chunk.write(3, encoded)
+				let hit = hitOf(span, scope, report)
+				stats.add(hit, weight) when hit.topLevel || (hit.spanKind := "server" || "client" || "producer" || "consumer")
+			}
+			let length = chunk.bytes().len()
+			if chunks.len() > 0 && size + length > traceBytes {
+				parts.push(tracePart(chunks, held, scope))
+				chunks = ProtoWriter[]
+				held = SpanRecord[]
+				size = 0
+			}
+			chunks.push(chunk)
+			held = held + traces[trace]
+			size += length
+		}
+		parts.push(tracePart(chunks, held, scope)) when chunks.len() > 0
+		let due = stats.due(wallNow(), false)
+		parts.push(statsPart(due, scope, stats)) when due.len() > 0
+		return parts
+	}
+
+	// An AgentPayload of chunks, one tracer payload holding them.
+	internal def tracePart(chunks ProtoWriter[], spans SpanRecord[], scope Scope) Part {
+		let tracer = new ProtoWriter()
+		tracer.write(2, "adm")
+		tracer.write(4, sdkVersion)
+		tracer.write(5, scope.session) unless scope.session.isEmpty()
+		for let chunk in chunks {
+			tracer.write(6, chunk)
+		}
+		tracer.write(8, scope.env) unless scope.env.isEmpty()
+		tracer.write(9, scope.host) unless scope.host.isEmpty()
+		tracer.write(10, scope.version) unless scope.version.isEmpty()
+		let payload = new ProtoWriter()
+		payload.write(1, scope.host) unless scope.host.isEmpty()
+		payload.write(2, scope.env) unless scope.env.isEmpty()
+		payload.write(5, tracer)
+		payload.write(7, "{sdkName}/{sdkVersion}")
+		let part = new Part("trace", "/api/v0.2/traces", "application/x-protobuf", payload.bytes())
+		part.spans = spans
+		return part
+	}
+
+	// A map<string, string> or map<string, double> entry.
+	internal def protoEntry(key string, value string) ProtoWriter {
+		let entry = new ProtoWriter()
+		entry.write(1, key)
+		entry.write(2, value)
+		return entry
+	}
+
+	internal def protoEntry(key string, value float64) ProtoWriter {
+		let entry = new ProtoWriter()
+		entry.write(1, key)
+		entry.write(2, float(value))
+		return entry
+	}
+
+	// A Span message.
+	internal def spanOf(span SpanRecord, scope Scope, sampleRate float64, report ?ErrorReport) ProtoWriter {
+		let trace = span.context.trace
+		let operation = attributeText(span, "operation.name")
+		let resource = attributeText(span, "resource.name")
+		let kind = attributeText(span, "span.type")
+		let out = new ProtoWriter()
+		out.write(1, scope.serviceName)
+		out.write(2, operation.isEmpty() ?? (span.name, operation))
+		out.write(3, resource.isEmpty() ?? (span.name, resource))
+		out.write(4, idOf(trace))
+		out.write(5, idOf(span.context.span))
+		out.write(6, span.parent.isEmpty() ?? (uint64(0), idOf(span.parent)))
+		out.write(7, int(span.start))
+		out.write(8, int(span.end - span.start))
+		let failed = span.failed || !(report is none)
+		out.write(9, int32(failed ?? (1, 0)))
+		let tagged = map<string, string>{"language": "adm", "_dd.p.tid": trace.len() >= 32 ?? (trace[:16], "")}
+		tagged["env"] = scope.env unless scope.env.isEmpty()
+		tagged["version"] = scope.version unless scope.version.isEmpty()
+		tagged["runtime-id"] = scope.session unless scope.session.isEmpty()
+		let metrics = map<string, float64>{}
+		for let (key, value) in span.attributes {
+			continue when key := "operation.name" || "resource.name" || "span.type"
+			let number = numberOf(value)
+			if number is none {
+				tagged[key] = "{value}"
+			} else {
+				metrics[key] = number
+			}
+		}
+		tagged["error.message"] = span.error when span.failed && !span.error.isEmpty()
+		if !(report is none) {
+			tagged["error.type"] = report.kind
+			tagged["error.message"] = report.message
+			let stack = stackText(report)
+			tagged["error.stack"] = stack unless stack.isEmpty()
+		}
+		if span.events.len() > 0 {
+			let events = any[]
+			for let happened in span.events {
+				events.push({"name": happened.name, "time_unix_nano": happened.time, "attributes": happened.attributes})
+			}
+			tagged["events"] = string((new JSON()).encode(events))
+		}
+		if entersService(span) {
+			metrics["_top_level"] = 1.0
+			metrics["_sampling_priority_v1"] = 1.0
+			metrics["_sample_rate"] = sampleRate
+		}
+		for let (key, value) in tagged {
+			out.write(10, protoEntry(key, value)) unless value.isEmpty()
+		}
+		for let (key, value) in metrics {
+			out.write(11, protoEntry(key, value))
+		}
+		out.write(12, kind.isEmpty() ?? ("custom", kind))
+		return out
+	}
+
+	// A number attribute as a float, none for anything else.
+	internal def numberOf(value any) ?float64 {
+		return float64(int(value)) when value is int
+		return float64(int64(value)) when value is int64
+		return float64(int32(value)) when value is int32
+		return float64(uint(value)) when value is uint
+		return float64(uint64(value)) when value is uint64
+		return float64(uint32(value)) when value is uint32
+		return float64(float(value)) when value is float
+		return float64(value) when value is float64
+		return float64(float32(value)) when value is float32
+		return none
+	}
+
+	// The low 64 bits of a hexadecimal id.
+	internal def idOf(hex string) uint64 {
+		return uint64(0) unless hex.len() >= 16 && /^[0-9a-f]+$/.test(hex)
+		return hex[hex.len() - 16:].toInt<uint64>(16)
+	}
+
+	// How the APM stats see a span.
+	internal def hitOf(span SpanRecord, scope Scope, report ?ErrorReport) Hit {
+		let operation = attributeText(span, "operation.name")
+		let resource = attributeText(span, "resource.name")
+		let kind = attributeText(span, "span.type")
+		let status = attributeText(span, "http.response.status_code")
+		return Hit{
+			serviceName: scope.serviceName,
+			name:        operation.isEmpty() ?? (span.name, operation),
+			resource:    resource.isEmpty() ?? (span.name, resource),
+			kind:        kind.isEmpty() ?? ("custom", kind),
+			spanKind:    attributeText(span, "span.kind"),
+			status:      /^[0-9]{3}$/.test(status) ?? (status.toInt<uint32>(), uint32(0)),
+			method:      attributeText(span, "http.request.method"),
+			endpoint:    attributeText(span, "http.route"),
+			root:        span.parent.isEmpty(),
+			topLevel:    entersService(span),
+			failed:      span.failed || !(report is none),
+			duration:    span.end - span.start,
+			end:         span.end,
+		}
+	}
+
+	// A StatsPayload (MessagePack) of buckets.
+	internal def statsPart(buckets map<int64, map<string, Group>>, scope Scope, stats StatsWindow) Part {
+		let list = MsgPackValue[]
+		for let (start, groups) in buckets {
+			let grouped = MsgPackValue[]
+			for let (_, group) in groups {
+				grouped.push(groupValue(group))
+			}
+			let bucket = new MsgPackValue(MsgPackKind.Map)
+			bucket.set("Start", new MsgPackValue(uint64(start)))
+			bucket.set("Duration", new MsgPackValue(uint64(bucketSpan)))
+			bucket.set("Stats", new MsgPackValue(grouped))
+			bucket.set("AgentTimeShift", new MsgPackValue(0))
+			list.push(bucket)
+		}
+		let client = new MsgPackValue(MsgPackKind.Map)
+		client.set("Hostname", new MsgPackValue(scope.host))
+		client.set("Env", new MsgPackValue(scope.env))
+		client.set("Version", new MsgPackValue(scope.version))
+		client.set("Stats", new MsgPackValue(list))
+		client.set("Lang", new MsgPackValue("adm"))
+		client.set("TracerVersion", new MsgPackValue(sdkVersion))
+		client.set("RuntimeID", new MsgPackValue(scope.session))
+		client.set("Sequence", new MsgPackValue(stats.next()))
+		client.set("AgentAggregation", new MsgPackValue(""))
+		client.set("Service", new MsgPackValue(scope.serviceName))
+		client.set("ContainerID", new MsgPackValue(""))
+		client.set("Tags", new MsgPackValue(MsgPackValue[]))
+		client.set("GitCommitSha", new MsgPackValue(""))
+		client.set("ImageTag", new MsgPackValue(""))
+		client.set("ProcessTagsHash", new MsgPackValue(uint64(0)))
+		client.set("ProcessTags", new MsgPackValue(""))
+		let payload = new MsgPackValue(MsgPackKind.Map)
+		payload.set("AgentHostname", new MsgPackValue(scope.host))
+		payload.set("AgentEnv", new MsgPackValue(scope.env))
+		payload.set("Stats", new MsgPackValue([client]))
+		payload.set("AgentVersion", new MsgPackValue("{sdkName}/{sdkVersion}"))
+		payload.set("ClientComputed", new MsgPackValue(true))
+		payload.set("SplitPayload", new MsgPackValue(false))
+		let part = new Part("trace", "/api/v0.2/stats", "application/msgpack", (new MsgPack()).encode(payload))
+		part.window = stats
+		part.buckets = buckets
+		return part
+	}
+
+	// One ClientGroupedStats.
+	internal def groupValue(group Group) MsgPackValue {
+		let hit = group.hit
+		let out = new MsgPackValue(MsgPackKind.Map)
+		out.set("Service", new MsgPackValue(hit.serviceName))
+		out.set("Name", new MsgPackValue(hit.name))
+		out.set("Resource", new MsgPackValue(hit.resource))
+		out.set("HTTPStatusCode", new MsgPackValue(uint64(hit.status)))
+		out.set("Type", new MsgPackValue(hit.kind))
+		out.set("DBType", new MsgPackValue(""))
+		out.set("Hits", new MsgPackValue(uint64(group.hits.round())))
+		out.set("Errors", new MsgPackValue(uint64(group.errors.round())))
+		out.set("Duration", new MsgPackValue(uint64(group.duration.round())))
+		out.set("OkSummary", new MsgPackValue(summaryOf(group.ok, group.okZero)))
+		out.set("ErrorSummary", new MsgPackValue(summaryOf(group.bad, group.badZero)))
+		out.set("Synthetics", new MsgPackValue(false))
+		out.set("TopLevelHits", new MsgPackValue(uint64(group.topLevel.round())))
+		out.set("SpanKind", new MsgPackValue(hit.spanKind))
+		out.set("PeerTags", new MsgPackValue(MsgPackValue[]))
+		out.set("IsTraceRoot", new MsgPackValue(hit.root ?? (1, 2)))
+		out.set("GRPCStatusCode", new MsgPackValue(""))
+		out.set("HTTPMethod", new MsgPackValue(hit.method))
+		out.set("HTTPEndpoint", new MsgPackValue(hit.endpoint))
+		out.set("srv_src", new MsgPackValue(""))
+		out.set("SpanDerivedPrimaryTags", new MsgPackValue(MsgPackValue[]))
+		out.set("AdditionalMetricTags", new MsgPackValue(MsgPackValue[]))
+		return out
+	}
+}

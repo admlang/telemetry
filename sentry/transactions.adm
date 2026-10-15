@@ -1,0 +1,179 @@
+partial module adm.telemetry.sentry {
+	use (
+		std.services.telemetry::(SpanRecord)
+	)
+
+	// How long an ended span waits for the span its trace began with here; after that it
+	// goes as a transaction of its own.
+	internal const longestWait = 5min
+
+	// The most ended spans kept waiting; beyond it the oldest go as transactions of
+	// their own.
+	internal const mostWaiting = 10000
+
+	// The first span of a unit of work in this program and the spans inside it: one
+	// Sentry transaction.
+	internal struct Tree {
+		root     SpanRecord
+		children SpanRecord[]
+	}
+
+	// Spans that ended inside another span of this program which has not ended yet.
+	//
+	// The Telemetry service hands spans over as they end, children before their parent.
+	// A span that begins a unit of work here (no parent, or a parent in another program)
+	// is a transaction; the spans that waited for it go out with it. A child that ends
+	// after its transaction went out goes as a transaction of its own, under the same
+	// trace, as one that waited longer than `longestWait`.
+	internal type Spans {
+		// The spans waiting, by span id, and when each was put aside.
+		internal waiting map<string, SpanRecord>
+		internal since   map<string, int64>
+		// The spans that went out lately, by span id, and when.
+		internal sent    map<string, int64>
+
+		def new() {}
+
+		// The transactions the spans of a batch complete, and those of spans that waited
+		// too long; the other spans wait.
+		atomic def gather(spans SpanRecord[]) Tree[] {
+			let now = wallNow()
+			let trees = Tree[]
+			for let span in spans {
+				waiting[span.context.span] = span
+				since[span.context.span] = now
+			}
+			for let span in spans {
+				let id = span.context.span
+				continue unless waiting.hasKey(id)
+				let begins = span.parent.isEmpty() || span.parentRemote || sent.hasKey(span.parent)
+				trees.push(take(span, now)) when begins
+			}
+			// Spans whose parent is not coming, oldest first: too old, or too many.
+			for let (id, at) in since.clone() {
+				continue unless waiting.hasKey(id)
+				continue unless now - at > int64(longestWait) || waiting.len() > mostWaiting
+				let span = waiting[id]
+				// Only the topmost of a waiting subtree goes; it takes its children along.
+				continue when waiting.hasKey(span.parent)
+				trees.push(take(span, now))
+			}
+			for let (id, at) in sent.clone() {
+				sent.delete(id) when now - at > int64(longestWait)
+			}
+			return trees
+		}
+
+		// Every span still waiting, as transactions, for the exporter's close.
+		atomic def drain() Tree[] {
+			let now = wallNow()
+			let trees = Tree[]
+			for let (id, span) in waiting.clone() {
+				continue unless waiting.hasKey(id)
+				continue when waiting.hasKey(span.parent)
+				trees.push(take(span, now))
+			}
+			return trees
+		}
+
+		// The tree under root, taken out of the waiting spans.
+		internal def take(root SpanRecord, now int64) Tree {
+			let below = map<string, string[]>{}
+			for let (id, span) in waiting {
+				continue when id == root.context.span
+				let list = below.get(span.parent)
+				if list is none {
+					below[span.parent] = [id]
+				} else {
+					list.push(id)
+				}
+			}
+			let tree = Tree{root: root}
+			let queue = [root.context.span]
+			let at = 0
+			for at < queue.len() {
+				let next = below.get(queue[at])
+				at++
+				continue when next is none
+				for let id in next {
+					let found = waiting.get(id)
+					continue when found is none
+					tree.children.push(found)
+					queue.push(id)
+				}
+			}
+			for let id in queue {
+				waiting.delete(id)
+				since.delete(id)
+				sent[id] = now
+			}
+			return tree
+		}
+	}
+
+	// Whether the trace is among those sent at rate: the same answer for one trace in
+	// every program, from digits of its id the Telemetry service's own sampling does not
+	// read. Also returns the draw, Sentry's `sample_rand`.
+	internal def keeps(trace string, rate float64) (bool, float64) {
+		let draw = trace.len() >= 16 ?? (float64(trace[8:16].toInt<uint32>(16)) / 4294967296.0, 0.0)
+		return (draw < rate, draw)
+	}
+
+	// The operation Sentry groups a span under: its `sentry.op` attribute, else `default`.
+	internal def opOf(span SpanRecord) string {
+		let op = span.attributes.get("sentry.op")
+		return "default" when op is none
+		return "{op}"
+	}
+
+	internal def statusOf(span SpanRecord) string {
+		return span.failed ?? ("internal_error", "ok")
+	}
+
+	// The attributes of a span as Sentry span data, with the error of a failed one.
+	internal def dataOf(span SpanRecord) map<string, any> {
+		let data = span.attributes.omitKeys(["sentry.op"])
+		data["error.message"] = span.error when span.failed && !span.error.isEmpty()
+		return data
+	}
+
+	// The transaction event of a tree.
+	internal def transactionEvent(id string, tree Tree, scope Scope) map<string, any> {
+		let root = tree.root
+		let event = baseEvent(id, scope, root.end)
+		event["type"] = "transaction"
+		event["transaction"] = root.name
+		event["transaction_info"] = {"source": "custom"}
+		event["start_timestamp"] = seconds(root.start)
+		event["tags"] = scope.tags
+		let trace = map<string, any>{
+			"trace_id": root.context.trace,
+			"span_id":  root.context.span,
+			"op":       opOf(root),
+			"status":   statusOf(root),
+			"origin":   "manual",
+			"data":     dataOf(root),
+		}
+		trace["parent_span_id"] = root.parent unless root.parent.isEmpty()
+		let contexts = scope.contexts.clone()
+		contexts["trace"] = trace
+		event["contexts"] = contexts
+		let spans = any[]
+		for let child in tree.children {
+			spans.push({
+				"span_id":         child.context.span,
+				"parent_span_id":  child.parent,
+				"trace_id":        child.context.trace,
+				"op":              opOf(child),
+				"description":     child.name,
+				"start_timestamp": seconds(child.start),
+				"timestamp":       seconds(child.end),
+				"status":          statusOf(child),
+				"origin":          "manual",
+				"data":            dataOf(child),
+			})
+		}
+		event["spans"] = spans
+		return event
+	}
+}

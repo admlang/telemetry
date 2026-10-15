@@ -1,0 +1,534 @@
+partial module adm.telemetry.prometheus {
+	use (
+		std.bytes::(Buffer)
+		std.crypto
+		std.data.compress.gzip
+		std.data.compress.snappy
+		std.data.encoding::(Base64)
+		std.net.http
+		std.net.tls
+		std.services.telemetry::(ExportFailure, MetricSample, TelemetryBatch)
+		std.time
+	)
+
+	// The most metric samples one remote write request carries.
+	internal const samplesPerRequest = 500
+
+	// The longest pause a receiver is granted.
+	internal const longestPause = 1h
+
+	// Which remote write protocol an Exporter speaks.
+	enum RemoteWriteVersion {
+		// Remote write 1.0 (`prometheus.WriteRequest`): what every receiver takes.
+		V1,
+		// Remote write 2.0 (`io.prometheus.write.v2.Request`): interned strings, metadata
+		// and start times on each series; Prometheus 3 and newer receivers.
+		V2,
+	}
+
+	// Pushes the metrics the Telemetry service reads to a remote write receiver:
+	// Prometheus started with `--web.enable-remote-write-receiver`, Mimir, Cortex, Thanos
+	// Receive, VictoriaMetrics, Grafana Cloud. The program opens no port.
+	//
+	// Counters go as `<name>_total`, gauges and toggles as gauges, histograms as classic
+	// `_bucket`/`_count`/`_sum` series and, with `nativeHistograms`, as native histograms
+	// (schema 2, the service's own ranges). Names take the unit as a suffix (`_seconds`,
+	// `_bytes`); every series carries `job` (the resource's `service.name`) and
+	// `instance` (its instance or installation id), and the other resource attributes go
+	// on a `target_info` series. A series no reading has updated for `stale` gets a
+	// staleness marker and is dropped.
+	//
+	// What the receiver could not take (no answer, 429, a 5xx) is kept for another try,
+	// after the pause a 429 asked for; what it refuses for good is dropped. Connecting
+	// needs the `adm.network.connect` permission for the receiver.
+	//
+	// ```
+	// let metrics = new prometheus.Exporter("https://prometheus.internal/api/v1/write")
+	// metrics.headers["Authorization"] = "Bearer {token}"
+	// ```
+	type Exporter {
+		// Headers sent with every request, for the receiver's authentication.
+		headers          map<string, string> = map<string, string>{}
+		// The protocol spoken.
+		version          RemoteWriteVersion  = RemoteWriteVersion.V1
+		// The `job` and `instance` labels; from the resource when empty.
+		job              string              = ""
+		instance         string              = ""
+		// Whether histograms also go as native histograms.
+		nativeHistograms bool                = false
+		// How long a series may go without a reading before it ends.
+		stale            duration            = 5min
+		// How long one request may take.
+		timeout          duration            = 10s
+		// TLS settings for an https receiver; none trusts the system's roots. Read when
+		// the first request is sent.
+		tls              ?tls.Config         = none
+
+		internal endpoint string
+		internal web      ?http.Client = none
+		internal store    Store
+
+		// endpoint is the receiver's write URL: `https://host/api/v1/write`.
+		def new(endpoint string) {
+			self.endpoint = endpoint
+			store = new Store()
+		}
+
+		// Name implements Exporter: `prometheus` and the endpoint.
+		def name() string {
+			return "prometheus {endpoint}"
+		}
+
+		// Export implements Exporter.
+		//
+		// Fails with an ExportFailure when the receiver did not take every sample: it
+		// cannot be reached, does not answer in time, or answers with a failure.
+		def export(batch TelemetryBatch) !none {
+			return none when batch.metrics.len() == 0
+			let extra = map<string, string>{"job": jobOf(batch.resource, job)}
+			let named = instanceOf(batch.resource, instance)
+			extra["instance"] = named unless named.isEmpty()
+			let points = Point[]
+			let sources = MetricSample[]
+			for let sample in batch.metrics {
+				let point = pointOf(sample, extra)
+				continue when point is none
+				points.push(point)
+				sources.push(sample)
+			}
+			store.update(points)
+			let (_, ended) = store.live(stale)
+			let now = wallNow()
+			let target = Written{kind: "info", family: "target_info", time: now, value: 1.0}
+			target.labels = withName(resourceLabels(batch.resource) + extra, "target_info")
+			let failure = ExportFailure{}
+			let rest = TelemetryBatch{resource: batch.resource}
+			let stopped = false
+			let at = 0
+			for at < points.len() || (at == 0 && ended.len() > 0) {
+				let end = at + samplesPerRequest > points.len() ?? (points.len(), at + samplesPerRequest)
+				let series = writtenOf(points[at:end], at == 0 ?? (ended, Point[]), nativeHistograms, now)
+				series.push(target) when at == 0
+				if stopped {
+					rest.metrics = rest.metrics + sources[at:end]
+				} else {
+					let outcome = post(series)
+					if outcome.again {
+						stopped = true
+						rest.metrics = rest.metrics + sources[at:end]
+						failure.retryAfter = outcome.wait
+						failure.message = outcome.message
+						failure.cause = outcome.cause
+					} else if !outcome.accepted {
+						failure.rejected += outcome.refused < 0 ?? (end - at, outcome.refused)
+						if failure.message.isEmpty() {
+							failure.message = outcome.message
+							failure.cause = outcome.cause
+						}
+					}
+				}
+				at = end
+				break when end == 0
+			}
+			return none when failure.message.isEmpty()
+			failure.rest = rest when stopped
+			fail failure
+		}
+
+		// Sends one request and reads how the receiver took it.
+		internal def post(series Written[]) Outcome {
+			let v2 = version == RemoteWriteVersion.V2
+			let body = snappy.compress(v2 ?? (writeRequestV2(series), writeRequestV1(series)))
+			let made = http.newRequest(http.Method.POST, endpoint, body) onerror (err error) {
+				let cause = PrometheusError{message: "prometheus: {endpoint}: {err.message}", code: "Unreachable", kind: ErrorKind.Unreachable, cause: err}
+				return Outcome{message: cause.message, cause: cause, refused: -1}
+			}
+			made.headers.set("Content-Type", v2 ?? ("application/x-protobuf;proto=io.prometheus.write.v2.Request", "application/x-protobuf"))
+			made.headers.set("Content-Encoding", "snappy")
+			made.headers.set("X-Prometheus-Remote-Write-Version", v2 ?? ("2.0.0", "0.1.0"))
+			made.headers.set("User-Agent", "{sdkName}/{sdkVersion}")
+			for let (name, value) in headers {
+				made.headers.set(name, value)
+			}
+			let response = client().do(made) onerror (err error) {
+				let cause = PrometheusError{message: "prometheus: {endpoint}: {err.message}", code: "Unreachable", kind: ErrorKind.Unreachable, cause: err}
+				return Outcome{again: true, message: cause.message, cause: cause}
+			}
+			let outcome = outcomeOf(endpoint, response)
+			if outcome.accepted && v2 && response.status != 202 {
+				// A 2.0 receiver says how much it wrote; what it did not write it refused.
+				let written = response.headers.get("X-Prometheus-Remote-Write-Samples-Written")
+				let histograms = response.headers.get("X-Prometheus-Remote-Write-Histograms-Written")
+				if /^[0-9]+$/.test(written) {
+					let sent = series.filter(one => one.histogram is none).len()
+					let sentHistograms = series.len() - sent
+					let took = written.toInt<int>() + (/^[0-9]+$/.test(histograms) ?? (histograms.toInt<int>(), sentHistograms))
+					return Outcome{message: "prometheus: {endpoint} wrote {took} of {series.len()} series", refused: series.len() - took} when took < series.len()
+				}
+			}
+			outcome.message += " (a 2.0 receiver; try RemoteWriteVersion.V1)" when response.status == 415 && v2
+			return outcome
+		}
+
+		// Close implements Exporter. Does not fail.
+		def close() !none {
+			web = none
+			return none
+		}
+
+		// The HTTP client, made on first use.
+		internal def client() http.Client {
+			let held = web
+			return held unless held is none
+			let made = new http.Client("", timeout)
+			let secured = tls
+			if !(secured is none) {
+				let transport = new http.Transport()
+				transport.tls = secured
+				made.transport = transport
+			}
+			web = made
+			return made
+		}
+	}
+
+	// Pushes the metrics the Telemetry service reads to a Prometheus Pushgateway, for
+	// jobs that end before a scrape would reach them. Each batch replaces the group's
+	// metrics (`PUT`) with every series read within `stale`, in the text format, under
+	// `job` and the grouping labels (`instance` by default).
+	//
+	// ```
+	// let gateway = new prometheus.Pushgateway("http://pushgateway:9091", job = "nightly-import")
+	// // ... at the end of the job:
+	// try gateway.delete()
+	// ```
+	type Pushgateway {
+		// Headers sent with every request, for the gateway's authentication.
+		headers       map<string, string> = map<string, string>{}
+		// The grouping labels after `job`; `instance` from the resource when empty.
+		grouping      map<string, string> = map<string, string>{}
+		// How long a series may go without a reading before it leaves the group.
+		stale         duration            = 5min
+		// Whether `close` deletes the group.
+		deleteOnClose bool                = false
+		timeout       duration            = 10s
+		tls           ?tls.Config         = none
+
+		internal url      string
+		internal job      string
+		internal web      ?http.Client        = none
+		internal store    Store
+		internal resource map<string, string> = map<string, string>{}
+
+		// url is the gateway's base URL; job its job, the resource's `service.name` when
+		// empty.
+		def new(url string, job string = "") {
+			self.url = url.trimEnd("/")
+			self.job = job
+			store = new Store()
+		}
+
+		// Name implements Exporter: `pushgateway` and the URL.
+		def name() string {
+			return "pushgateway {url}"
+		}
+
+		// Export implements Exporter.
+		//
+		// Fails with an ExportFailure when the gateway did not take the push.
+		def export(batch TelemetryBatch) !none {
+			return none when batch.metrics.len() == 0
+			resource = batch.resource
+			let points = Point[]
+			for let sample in batch.metrics {
+				let point = pointOf(sample, map<string, string>{})
+				points.push(point) unless point is none
+			}
+			store.update(points)
+			let (live, _) = store.live(stale)
+			let target = Point{family: "target_info", kind: "gauge", value: 1.0, labels: resourceLabels(resource)}
+			live.push(target) when target.labels.len() > 0
+			let outcome = send(http.Method.PUT, textOf(live, none, false).bytes())
+			return none when outcome.accepted
+			let failure = ExportFailure{message: outcome.message, cause: outcome.cause, retryAfter: outcome.wait}
+			if outcome.again {
+				failure.rest = TelemetryBatch{resource: batch.resource, metrics: batch.metrics}
+			} else {
+				failure.rejected = batch.metrics.len()
+			}
+			fail failure
+		}
+
+		// Deletes the group's metrics from the gateway. Fails when the gateway cannot be
+		// reached or refuses.
+		def delete() !none {
+			let outcome = send(http.Method.DELETE, byte[])
+			return none when outcome.accepted
+			let cause = outcome.cause
+			fail cause unless cause is none
+			fail PrometheusError{message: outcome.message, code: "Refused", kind: ErrorKind.Refused}
+		}
+
+		// The group's path: `/metrics/job/<job>/<label>/<value>...`, a value holding `/`
+		// (or empty) written as `<label>@base64/<base64url>`.
+		def path() string {
+			let out = "/metrics" + segment("job", jobOf(resource, job))
+			let labels = grouping.clone()
+			if labels.len() == 0 {
+				let named = instanceOf(resource, "")
+				labels["instance"] = named unless named.isEmpty()
+			}
+			let names = labels.keys()
+			names.sort((a, b) => a < b)
+			for let name in names {
+				let value = labels.get(name)
+				out += segment(labelName(name), value) unless value is none
+			}
+			return out
+		}
+
+		internal def send(method http.Method, body byte[]) Outcome {
+			let target = url + path()
+			let made = http.newRequest(method, target, body) onerror (err error) {
+				let cause = PrometheusError{message: "pushgateway: {target}: {err.message}", code: "Unreachable", kind: ErrorKind.Unreachable, cause: err}
+				return Outcome{message: cause.message, cause: cause}
+			}
+			made.headers.set("Content-Type", textType) when body.len() > 0
+			made.headers.set("User-Agent", "{sdkName}/{sdkVersion}")
+			for let (name, value) in headers {
+				made.headers.set(name, value)
+			}
+			let response = client().do(made) onerror (err error) {
+				let cause = PrometheusError{message: "pushgateway: {target}: {err.message}", code: "Unreachable", kind: ErrorKind.Unreachable, cause: err}
+				return Outcome{again: true, message: cause.message, cause: cause}
+			}
+			return outcomeOf(target, response)
+		}
+
+		// Close implements Exporter: deletes the group when `deleteOnClose` is set. Fails
+		// as `delete` does.
+		def close() !none {
+			try delete() when deleteOnClose
+			web = none
+			return none
+		}
+
+		// The HTTP client, made on first use.
+		internal def client() http.Client {
+			let held = web
+			return held unless held is none
+			let made = new http.Client("", timeout)
+			let secured = tls
+			if !(secured is none) {
+				let transport = new http.Transport()
+				transport.tls = secured
+				made.transport = transport
+			}
+			web = made
+			return made
+		}
+	}
+
+	// One path segment pair of a Pushgateway group.
+	internal def segment(name string, value string) string {
+		return "/{name}@base64/=" when value.isEmpty()
+		return "/{name}@base64/{(Base64{urlSafe: true, padded: true}).encode(value.bytes())}" when value.contains("/")
+		return "/{name}/{value}"
+	}
+
+	// Serves the metrics the Telemetry service reads for Prometheus to scrape, on a
+	// listener of its own: never a route of the program's own server.
+	//
+	// It listens on `127.0.0.1:9464` unless given another address. An address other than
+	// a loopback one is refused unless scrapes must show the bearer `token` or a client
+	// certificate (`tls` with `clientAuth` = `RequireAndVerifyClientCert`), the two ways
+	// a Prometheus scrape configuration authenticates.
+	//
+	// `/metrics` answers in the format the scraper asks for: protobuf (with native
+	// histograms), OpenMetrics 1.0 (with `target_info` and `_created`), else the text
+	// format 0.0.4; gzip-compressed when asked. Series no reading has updated for `stale`
+	// leave the page. Prometheus adds `job` and `instance` from its own configuration.
+	//
+	// ```
+	// let page = new prometheus.Endpoint("0.0.0.0:9464")
+	// page.token = scrapeToken
+	// try page.start()
+	// ```
+	type Endpoint {
+		// The bearer token a scrape must show; none to ask for none.
+		token ?Secret<string> = none
+		// TLS for the listener: its certificate and, to require them, the client
+		// certificates it accepts.
+		tls   ?tls.Config     = none
+		// How long a series may go without a reading before it leaves the page.
+		stale duration        = 5min
+
+		internal listen   string
+		internal server   ?http.Server        = none
+		internal store    Store
+		internal resource map<string, string> = map<string, string>{}
+
+		def new(address string = "127.0.0.1:9464") {
+			listen = address
+			store = new Store()
+		}
+
+		// Name implements Exporter: `prometheus endpoint` and the address.
+		def name() string {
+			return "prometheus endpoint {listen}"
+		}
+
+		// Starts listening; `export` starts it too. A second call does nothing. Fails with
+		// a `Listen` PrometheusError when the address is not a loopback one and neither a
+		// token nor required client certificates guard it, or when it cannot be bound.
+		def start() !none {
+			return none unless server is none
+			fail PrometheusError{message: "prometheus: {listen} is reachable beyond this machine: set a token or require client certificates", code: "Listen", kind: ErrorKind.Listen} when !isLoopback(listen) && token is none && !requiresCertificates(tls)
+			let made = new http.Server(listen, self)
+			made.tls = tls
+			made.start() onerror (err error) {
+				fail PrometheusError{message: "prometheus: cannot listen on {listen}: {err.message}", code: "Listen", kind: ErrorKind.Listen, cause: err}
+			}
+			server = made
+			return none
+		}
+
+		// The address it listens on once started (with the port the system chose for
+		// port 0), else the one it was given.
+		def address() string {
+			let held = server
+			return listen when held is none
+			return held.address().str()
+		}
+
+		// Serve implements http.Handler: the page at `/metrics`. Fails when the answer
+		// cannot be compressed or written.
+		def serve(ctx http.Context) !none {
+			return try ctx.error(404, "") unless ctx.request.url.path == "/metrics"
+			return try ctx.error(405, "") unless ctx.request.method := http.Method.GET || http.Method.HEAD
+			let wanted = token
+			if !(wanted is none) {
+				let shown = ctx.header("Authorization").bytes()
+				let expected = "Bearer {wanted.reveal()}".bytes()
+				if !crypto.constantTimeEqual(shown, expected) {
+					ctx.setHeader("WWW-Authenticate", "Bearer")
+					return try ctx.error(401, "")
+				}
+			}
+			let (live, _) = store.live(stale)
+			let accept = ctx.header("Accept")
+			let kind = textType
+			let body = byte[]
+			if accept.contains("application/vnd.google.protobuf") && accept.contains("io.prometheus.client.MetricFamily") {
+				kind = protobufType
+				body = protobufOf(live)
+			} else if accept.contains("application/openmetrics-text") {
+				kind = openMetricsType
+				body = textOf(live, resourceLabels(resource), true).bytes()
+			} else {
+				body = textOf(live, none, false).bytes()
+			}
+			if ctx.header("Accept-Encoding").contains("gzip") {
+				let packed = new Buffer()
+				let packer = new gzip.Writer(packed)
+				try packer.write(body)
+				try packer.close()
+				body = packed.bytes()
+				ctx.setHeader("Content-Encoding", "gzip")
+			}
+			return try ctx.blob(200, kind, body)
+		}
+
+		// Export implements Exporter: the batch's readings become the page.
+		//
+		// Fails with an ExportFailure when the endpoint cannot start (see `start`); the
+		// readings are kept for the page all the same.
+		def export(batch TelemetryBatch) !none {
+			return none when batch.metrics.len() == 0
+			resource = batch.resource
+			let points = Point[]
+			for let sample in batch.metrics {
+				let point = pointOf(sample, map<string, string>{})
+				points.push(point) unless point is none
+			}
+			store.update(points)
+			start() onerror (err error) {
+				fail ExportFailure{message: err.message, cause: err}
+			}
+			return none
+		}
+
+		// Close implements Exporter: stops listening. Fails when the listener does not
+		// close.
+		def close() !none {
+			let held = server
+			server = none
+			try held.close() unless held is none
+			return none
+		}
+	}
+
+	// Whether an address listens on this machine only.
+	internal def isLoopback(address string) bool {
+		let cut = address.lastIndexOf(":")
+		let host = cut < 0 ?? (address, address[:cut])
+		host = host[1:host.len() - 1] when host.startsWith("[") && host.endsWith("]")
+		return host == "localhost" || host == "::1" || host.startsWith("127.")
+	}
+
+	// Whether TLS settings demand a verified client certificate.
+	internal def requiresCertificates(settings ?tls.Config) bool {
+		return false when settings is none
+		return settings.clientAuth == tls.ClientAuthType.RequireAndVerifyClientCert
+	}
+
+	// How a receiver took one request.
+	internal struct Outcome {
+		accepted bool
+		// The samples are to be sent again.
+		again    bool
+		wait     duration
+		message  string
+		cause    ?error   = none
+		// How many samples it refused; -1 for all of the request's.
+		refused  int      = -1
+	}
+
+	// The outcome of a response from target.
+	internal def outcomeOf(target string, response http.Response) Outcome {
+		let said = response.text() onerror recover ""
+		return Outcome{accepted: true, refused: 0} when response.status >= 200 && response.status < 300
+		let message = "prometheus: {target} answered {response.status}" + (said.trim().isEmpty() ?? ("", ": {clip(said.trim(), 300)}"))
+		let cause = PrometheusError{message: message, code: "{response.status}", status: response.status, serverText: said}
+		if response.status == 429 || response.status >= 500 {
+			let wait = pauseOf(response.headers.get("Retry-After"))
+			cause.kind = response.status == 429 ?? (ErrorKind.RateLimited, ErrorKind.ServerError)
+			cause.retryAfter = wait
+			return Outcome{again: true, wait: wait, message: message, cause: cause}
+		}
+		cause.kind = ErrorKind.Refused
+		return Outcome{message: message, cause: cause}
+	}
+
+	// A pause within what a receiver is granted.
+	internal def bounded(pause duration) duration {
+		return 0s when pause < 0s
+		return pause > longestPause ?? (longestPause, pause)
+	}
+
+	// The pause a `Retry-After` header asks for: seconds, or a date to wait until.
+	internal def pauseOf(header string) duration {
+		let text = header.trim()
+		return 0s when text.isEmpty()
+		return bounded(duration(text.toInt<int64>() * 1000000000)) when /^[0-9]{1,9}$/.test(text)
+		let until = time.parseHTTPDate(text) onerror (err error) {
+			return 0s
+		}
+		return bounded(until - time.now())
+	}
+
+	// text cut to at most length characters.
+	internal def clip(text string, length int) string {
+		return text.len() > length ?? (text[:length], text)
+	}
+}

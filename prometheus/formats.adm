@@ -1,0 +1,420 @@
+partial module adm.telemetry.prometheus {
+	use (
+		std.data.encoding::(ProtoEncoding, ProtoWriter)
+	)
+
+	// Content types of the scrape formats.
+	internal const textType = "text/plain; version=0.0.4; charset=utf-8"
+	internal const openMetricsType = "application/openmetrics-text; version=1.0.0; charset=utf-8"
+	internal const protobufType = "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited"
+
+	// The points of one family, in a stable order.
+	internal struct Family {
+		name   string
+		kind   string
+		help   string
+		unit   string
+		points Point[]
+	}
+
+	// Points grouped by family, families and series sorted by name.
+	internal def familiesOf(points Point[]) Family[] {
+		let byName = map<string, Family>{}
+		for let point in points {
+			let held = byName.get(point.family)
+			if held is none {
+				byName[point.family] = Family{name: point.family, kind: point.kind, help: point.help, unit: point.unit, points: [point]}
+			} else {
+				held.points.push(point)
+			}
+		}
+		let names = byName.keys()
+		names.sort((a, b) => a < b)
+		let out = Family[]
+		for let name in names {
+			let family = byName.get(name)
+			continue when family is none
+			family.points.sort((a, b) => keyOf(a) < keyOf(b))
+			out.push(family)
+		}
+		return out
+	}
+
+	// A label value with `\`, `"` and line feeds escaped.
+	internal def escapeValue(text string) string {
+		return text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+	}
+
+	// HELP text with `\` and line feeds escaped (and `"` too in OpenMetrics).
+	internal def escapeHelp(text string, openMetrics bool) string {
+		let out = text.replace("\\", "\\\\").replace("\n", "\\n")
+		return openMetrics ?? (out.replace("\"", "\\\""), out)
+	}
+
+	// `{name="value",...}` of labels in order of name, with extra (`le`) last; "" when
+	// there are none.
+	internal def labelText(labels map<string, string>, extra string = "") string {
+		let names = labels.keys()
+		names.sort((a, b) => a < b)
+		let parts = string[]
+		for let name in names {
+			let value = labels.get(name)
+			parts.push("{name}=\"{escapeValue(value)}\"") unless value is none
+		}
+		parts.push(extra) unless extra.isEmpty()
+		return parts.len() == 0 ?? ("", "\{" + parts.join(",") + "}")
+	}
+
+	// The text exposition of points: OpenMetrics 1.0 (with target_info, `_created` and
+	// `# EOF`) or Prometheus 0.0.4. target is the labels of `target_info`, none to leave it
+	// out.
+	internal def textOf(points Point[], target ?map<string, string>, openMetrics bool) string {
+		let lines = string[]
+		let created = canonical(float64(startMillis()) / 1000.0)
+		if openMetrics && !(target is none) && target.len() > 0 {
+			lines.push("# TYPE target info")
+			lines.push("target_info{labelText(target)} 1")
+		}
+		for let family in familiesOf(points) {
+			let typeName = family.kind
+			let named = family.kind == "counter" && !openMetrics ?? (family.name + "_total", family.name)
+			lines.push("# TYPE {named} {typeName}")
+			lines.push("# UNIT {family.name} {family.unit}") when openMetrics && !family.unit.isEmpty()
+			lines.push("# HELP {named} {escapeHelp(family.help, openMetrics)}") unless family.help.isEmpty()
+			for let point in family.points {
+				let labels = labelText(point.labels)
+				switch family.kind {
+					case "counter":
+						lines.push("{family.name}_total{labels} {shortest(point.value)}")
+						lines.push("{family.name}_created{labels} {created}") when openMetrics
+					case "histogram":
+						for let bucket in bucketsOf(point) {
+							let le = openMetrics ?? (canonical(bucket.upper), shortest(bucket.upper))
+							lines.push("{family.name}_bucket{labelText(point.labels, "le=\"{le}\"")} {bucket.total}")
+						}
+						lines.push("{family.name}_count{labels} {point.count}")
+						lines.push("{family.name}_sum{labels} {shortest(point.sum)}")
+						lines.push("{family.name}_created{labels} {created}") when openMetrics
+					default:
+						lines.push("{family.name}{labels} {shortest(point.value)}")
+				}
+			}
+		}
+		lines.push("# EOF") when openMetrics
+		return lines.join("\n") + (lines.len() == 0 ?? ("", "\n"))
+	}
+
+	// A google.protobuf.Timestamp of milliseconds.
+	internal def timestampOf(millis int64) ProtoWriter {
+		let out = new ProtoWriter()
+		out.write(1, int(millis / 1000))
+		out.write(2, int32((millis % 1000) * 1000000))
+		return out
+	}
+
+	// A LabelPair (or remote write 1.0 Label): both are name 1, value 2.
+	internal def pairOf(name string, value string) ProtoWriter {
+		let out = new ProtoWriter()
+		out.write(1, name)
+		out.write(2, value)
+		return out
+	}
+
+	// The native histogram fields shared by the scrape and remote write messages, which
+	// number them alike from the schema on except where noted: spans, deltas and the zero
+	// bucket. first is the field of the schema (5 in client_model, 4 in remote write).
+	internal def writeNative(out ProtoWriter, point Point, schemaField int, zeroThresholdField int, zeroCountField int, spanField int, deltaField int) {
+		let (spans, deltas, zero) = nativeOf(point)
+		out.write(schemaField, int32(nativeSchema), ProtoEncoding.ZigZag)
+		out.write(zeroThresholdField, float(zeroThreshold))
+		out.write(zeroCountField, zero)
+		for let span in spans {
+			let made = new ProtoWriter()
+			made.write(1, int32(span.offset), ProtoEncoding.ZigZag)
+			made.write(2, uint32(span.length))
+			out.write(spanField, made)
+		}
+		out.writePacked(deltaField, deltas, ProtoEncoding.ZigZag)
+	}
+
+	// The protobuf exposition of points: length-delimited MetricFamily messages, each
+	// histogram with its classic buckets and its native buckets.
+	internal def protobufOf(points Point[]) byte[] {
+		let out = byte[]
+		let start = startMillis()
+		for let family in familiesOf(points) {
+			let message = new ProtoWriter()
+			message.write(1, family.kind == "counter" ?? (family.name + "_total", family.name))
+			message.write(2, family.help) unless family.help.isEmpty()
+			message.write(3, family.kind == "counter" ?? (0, family.kind == "gauge" ?? (1, 4)))
+			for let point in family.points {
+				let metric = new ProtoWriter()
+				let names = point.labels.keys()
+				names.sort((a, b) => a < b)
+				for let name in names {
+					let value = point.labels.get(name)
+					metric.write(1, pairOf(name, value)) unless value is none
+				}
+				switch family.kind {
+					case "counter":
+						let counter = new ProtoWriter()
+						counter.write(1, float(point.value))
+						counter.write(3, timestampOf(start))
+						metric.write(3, counter)
+					case "histogram":
+						let histogram = new ProtoWriter()
+						histogram.write(1, point.count)
+						histogram.write(2, float(point.sum))
+						for let bucket in bucketsOf(point) {
+							continue when bucket.upper * 0.0 != 0.0
+							let made = new ProtoWriter()
+							made.write(1, bucket.total)
+							made.write(2, float(bucket.upper))
+							histogram.write(3, made)
+						}
+						writeNative(histogram, point, 5, 6, 7, 12, 13)
+						histogram.write(15, timestampOf(start))
+						metric.write(7, histogram)
+					default:
+						let gauge = new ProtoWriter()
+						gauge.write(1, float(point.value))
+						metric.write(2, gauge)
+				}
+				message.write(4, metric)
+			}
+			message.write(5, family.unit) unless family.unit.isEmpty()
+			let bytes = message.bytes()
+			out = out + varint(uint64(bytes.len())) + bytes
+		}
+		return out
+	}
+
+	// An unsigned varint.
+	internal def varint(value uint64) byte[] {
+		let out = byte[]
+		let rest = value
+		for rest >= uint64(128) {
+			out.push(byte((rest & uint64(127)) | uint64(128)))
+			rest = rest >> 7
+		}
+		out.push(byte(rest))
+		return out
+	}
+
+	// One series of a remote write request: its labels (with `__name__`) and one sample,
+	// a native histogram, or a staleness marker.
+	internal struct Written {
+		labels     map<string, string>
+		kind       string
+		help       string
+		unit       string
+		family     string
+		time       int64
+		value      float64
+		stale      bool
+		histogram  ?Point              = none
+		// Whether its value counts from the program's start (counters, histogram parts).
+		cumulative bool
+	}
+
+	// The series of points for remote write: a counter as `_total`, a gauge as itself, a
+	// histogram as its classic `_bucket`, `_count` and `_sum` series and, with native, one
+	// native histogram series. ended points become staleness markers at now.
+	internal def writtenOf(points Point[], ended Point[], native bool, now int64) Written[] {
+		let out = Written[]
+		for let point in points {
+			for let one in seriesOf(point, native) {
+				out.push(one)
+			}
+		}
+		for let point in ended {
+			for let one in seriesOf(point, native) {
+				one.stale = true
+				one.time = now
+				out.push(one)
+			}
+		}
+		return out
+	}
+
+	internal def seriesOf(point Point, native bool) Written[] {
+		let out = Written[]
+		let base = Written{kind: point.kind, help: point.help, unit: point.unit, family: point.family, time: point.time, cumulative: point.kind != "gauge"}
+		switch point.kind {
+			case "counter":
+				let one = base
+				one.labels = withName(point.labels, point.family + "_total")
+				one.value = point.value
+				out.push(one)
+			case "histogram":
+				for let bucket in bucketsOf(point) {
+					let one = Written{kind: point.kind, help: point.help, unit: point.unit, family: point.family, time: point.time, cumulative: true}
+					one.labels = withName(point.labels, point.family + "_bucket")
+					one.labels["le"] = shortest(bucket.upper)
+					one.value = float64(bucket.total)
+					out.push(one)
+				}
+				let counted = Written{kind: point.kind, help: point.help, unit: point.unit, family: point.family, time: point.time, cumulative: true}
+				counted.labels = withName(point.labels, point.family + "_count")
+				counted.value = float64(point.count)
+				out.push(counted)
+				let summed = Written{kind: point.kind, help: point.help, unit: point.unit, family: point.family, time: point.time, cumulative: true}
+				summed.labels = withName(point.labels, point.family + "_sum")
+				summed.value = point.sum
+				out.push(summed)
+				if native {
+					let whole = Written{kind: point.kind, help: point.help, unit: point.unit, family: point.family, time: point.time, cumulative: true, histogram: point}
+					whole.labels = withName(point.labels, point.family)
+					out.push(whole)
+				}
+			default:
+				let one = base
+				one.labels = withName(point.labels, point.family)
+				one.value = point.value
+				out.push(one)
+		}
+		return out
+	}
+
+	internal def withName(labels map<string, string>, name string) map<string, string> {
+		let out = labels.clone()
+		out["__name__"] = name
+		return out
+	}
+
+	// The metadata type of a series: counter 1, gauge 2, histogram 3, info 6.
+	internal def typeCode(kind string) int {
+		switch kind {
+			case "counter":
+				return 1
+			case "gauge":
+				return 2
+			case "histogram":
+				return 3
+			case "info":
+				return 6
+			default:
+				return 0
+		}
+	}
+
+	// A remote write 1.0 WriteRequest.
+	internal def writeRequestV1(series Written[]) byte[] {
+		let out = new ProtoWriter()
+		let families = map<string, Written>{}
+		for let one in series {
+			let message = new ProtoWriter()
+			let names = one.labels.keys()
+			names.sort((a, b) => a < b)
+			for let name in names {
+				let value = one.labels.get(name)
+				message.write(1, pairOf(name, value)) unless value is none
+			}
+			let held = one.histogram
+			if held is none {
+				let sample = new ProtoWriter()
+				if one.stale {
+					sample.write(1, staleBits, ProtoEncoding.Fixed)
+				} else {
+					sample.write(1, float(one.value))
+				}
+				sample.write(2, int(one.time / 1000000))
+				message.write(2, sample)
+			} else {
+				message.write(4, histogramOf(held, one, false))
+			}
+			out.write(1, message)
+			families[one.family] = one unless families.hasKey(one.family)
+		}
+		for let (name, one) in families {
+			let described = new ProtoWriter()
+			described.write(1, typeCode(one.kind))
+			described.write(2, name)
+			described.write(4, one.help) unless one.help.isEmpty()
+			described.write(5, one.unit) unless one.unit.isEmpty()
+			out.write(3, described)
+		}
+		return out.bytes()
+	}
+
+	// A native histogram message of remote write (1.0 and 2.0 number it alike; 2.0 adds
+	// the start time).
+	internal def histogramOf(point Point, one Written, v2 bool) ProtoWriter {
+		let out = new ProtoWriter()
+		out.write(1, point.count)
+		if one.stale {
+			out.write(3, staleBits, ProtoEncoding.Fixed)
+		} else {
+			out.write(3, float(point.sum))
+			writeNative(out, point, 4, 5, 6, 11, 12)
+		}
+		out.write(15, int(one.time / 1000000))
+		out.write(17, int(startMillis())) when v2
+		return out
+	}
+
+	// The symbol table of a remote write 2.0 request: each string once, the empty one first.
+	internal type Symbols {
+		symbols string[]         = [""]
+		refs    map<string, int> = map<string, int>{"": 0}
+
+		def new() {}
+
+		// The index of text, added when it is new.
+		def refOf(text string) int {
+			let held = refs.get(text)
+			return held unless held is none
+			refs[text] = symbols.len()
+			symbols.push(text)
+			return symbols.len() - 1
+		}
+	}
+
+	// A remote write 2.0 Request: every string in the symbol table, the empty one first.
+	internal def writeRequestV2(series Written[]) byte[] {
+		let table = new Symbols()
+		let start = startMillis()
+		let bodies = ProtoWriter[]
+		for let one in series {
+			let message = new ProtoWriter()
+			let names = one.labels.keys()
+			names.sort((a, b) => a < b)
+			let labelRefs = uint32[]
+			for let name in names {
+				let value = one.labels.get(name)
+				continue when value is none
+				labelRefs.push(uint32(table.refOf(name)))
+				labelRefs.push(uint32(table.refOf(value)))
+			}
+			message.writePacked(1, labelRefs)
+			let held = one.histogram
+			if held is none {
+				let sample = new ProtoWriter()
+				if one.stale {
+					sample.write(1, staleBits, ProtoEncoding.Fixed)
+				} else {
+					sample.write(1, float(one.value))
+				}
+				sample.write(2, int(one.time / 1000000))
+				sample.write(3, int(start)) when one.cumulative && !one.stale
+				message.write(2, sample)
+			} else {
+				message.write(3, histogramOf(held, one, true))
+			}
+			let described = new ProtoWriter()
+			described.write(1, typeCode(one.kind))
+			described.write(3, uint32(table.refOf(one.help))) unless one.help.isEmpty()
+			described.write(4, uint32(table.refOf(one.unit))) unless one.unit.isEmpty()
+			message.write(5, described)
+			bodies.push(message)
+		}
+		let out = new ProtoWriter()
+		for let text in table.symbols {
+			out.write(4, text)
+		}
+		for let body in bodies {
+			out.write(5, body)
+		}
+		return out.bytes()
+	}
+}

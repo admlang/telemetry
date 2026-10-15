@@ -1,0 +1,90 @@
+partial module adm.telemetry.sentry {
+	use (
+		std.errors
+		std.net.url
+	)
+
+	// What kind of failure a SentryError is.
+	enum ErrorKind {
+		// The DSN does not parse: no key, no project, not http or https.
+		BadDsn,
+		// The server could not be reached or did not answer in time.
+		Unreachable,
+		// The server refused the envelope for good (a 4xx other than 429).
+		Refused,
+		// The server asked for a pause (429, or a rate limit covering what was sent).
+		RateLimited,
+		// The server failed (5xx).
+		ServerError,
+	}
+
+	// What the exporter fails with, as the cause of the `ExportFailure` the Telemetry
+	// service receives.
+	struct SentryError {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		kind       ErrorKind
+		// The HTTP status of the answer; 0 when there was none.
+		status     int
+		// What the server said in `X-Sentry-Error`, "" when it said nothing.
+		serverText string
+		// The pause the server asked for; 0s when it asked for none.
+		retryAfter duration
+	}
+
+	// The name and version the exporter gives itself in envelopes and the auth header.
+	internal const sdkName = "sentry.adm"
+	internal const sdkVersion = "0.1.0"
+
+	// A DSN taken apart: `https://<key>[:<secret>]@<host>[:<port>][/<prefix>]/<project>`.
+	internal struct Dsn {
+		text      string
+		scheme    string
+		// The host with its port when the DSN gives one.
+		host      string
+		// The path before the project id, without a trailing `/`; "" for most servers.
+		prefix    string
+		project   string
+		publicKey string
+		secretKey string
+	}
+
+	// The DSN in text taken apart. Fails with a `BadDsn` SentryError when the text is not
+	// an http or https URL with a key and a project id.
+	internal def parseDsn(text string) !Dsn {
+		let trimmed = text.trim()
+		fail dsnError("no DSN: give one or set SENTRY_DSN") when trimmed.isEmpty()
+		let parsed = url.parse(trimmed) onerror (err error) {
+			fail dsnError("DSN {trimmed}: {err.message}")
+		}
+		fail dsnError("DSN {trimmed}: the scheme is {parsed.scheme}, not http or https") unless parsed.scheme := "http" || "https"
+		fail dsnError("DSN {trimmed}: no host") when parsed.host.isEmpty()
+		let user = parsed.user
+		fail dsnError("DSN {trimmed}: no public key before the @") when user is none || user.username.isEmpty()
+		let path = parsed.path.trimEnd("/")
+		let cut = path.lastIndexOf("/")
+		fail dsnError("DSN {trimmed}: no project id at the end of the path") when cut < 0 || cut == path.len() - 1
+		let made = Dsn{text: trimmed, scheme: parsed.scheme, host: parsed.host, prefix: path[:cut], project: path[cut + 1:], publicKey: user.username}
+		let secret = user.password
+		made.secretKey = secret unless secret is none
+		return made
+	}
+
+	internal def dsnError(message string) SentryError {
+		return SentryError{message: "sentry: {message}", code: "BadDsn", kind: ErrorKind.BadDsn}
+	}
+
+	// The envelope endpoint of the DSN's project.
+	internal def envelopeURL(dsn Dsn) string {
+		return "{dsn.scheme}://{dsn.host}{dsn.prefix}/api/{dsn.project}/envelope/"
+	}
+
+	// The `X-Sentry-Auth` header of every request.
+	internal def authHeader(dsn Dsn) string {
+		let header = "Sentry sentry_version=7, sentry_client={sdkName}/{sdkVersion}, sentry_key={dsn.publicKey}"
+		header += ", sentry_secret={dsn.secretKey}" unless dsn.secretKey.isEmpty()
+		return header
+	}
+}

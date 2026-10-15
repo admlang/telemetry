@@ -1,0 +1,384 @@
+partial module adm.telemetry.statsd {
+	use (
+		std.errors
+		std.math
+		std.metrics::(Distribution)
+		std.net
+		std.services.policy::(Policy)
+		std.services.telemetry::(ExportFailure, MetricSample, TelemetryBatch)
+	)
+
+	// How labels travel on a StatsD line.
+	enum TagStyle {
+		// `name:1|c|#key:value,key:value`: DogStatsD, Telegraf (datadog extensions),
+		// statsd_exporter, Netdata.
+		DogStatsD,
+		// `name,key=value:1|c`: Telegraf, statsd_exporter.
+		Influx,
+		// `name;key=value:1|c`: Graphite 1.1 tags.
+		Graphite,
+		// No tags: `name.key_value:1|c`, the labels in the name in order of key, for servers
+		// that read none (Etsy's StatsD).
+		None,
+	}
+
+	// What an Exporter fails with, as the cause of the `ExportFailure`.
+	struct StatsDError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+	}
+
+	// The Telemetry service's histograms: four ranges per doubling, range `at` ending at
+	// 2^((at - 128) / 4); range 0 holds zero, negatives and values up to 2^-32.
+	internal const rangesPerDoubling = 4
+	internal const rangeShift = 128
+	internal const topRange = 385
+
+	// Sends the metrics the Telemetry service reads as StatsD lines to Graphite, Telegraf,
+	// Netdata, statsd_exporter or any other StatsD server.
+	//
+	// Counters go as `c` with what was added since the last batch (the service reports
+	// totals), gauges and toggles as `g` (a negative gauge as `0` then the value, since a
+	// signed `g` adds to the gauge), histograms as samples: each range of the service's
+	// histogram that took new values is one line at the range's middle value with the
+	// sample rate `@1/n` that makes the server count its n values, as `ms` in milliseconds
+	// for a time unit, else as `h`.
+	//
+	// Over UDP and Unix datagram sockets lines are packed into packets of at most
+	// `packetSize` bytes and a lost packet goes unnoticed; over TCP and Unix stream sockets
+	// each line ends with a newline and a failed write reconnects once. Connecting needs the
+	// `adm.network.connect` permission for the server.
+	//
+	// ```
+	// let metrics = new statsd.Exporter("udp://127.0.0.1:8125")
+	// metrics.prefix = "shop."
+	// ```
+	type Exporter {
+		// Put before every name: `shop.`.
+		prefix       string              = ""
+		// Tags every line carries.
+		tags         map<string, string> = map<string, string>{}
+		// Resource attributes that go as tags too: `["service.name"]`.
+		resourceTags string[]            = []
+		// How labels travel.
+		tagStyle     TagStyle            = TagStyle.DogStatsD
+		// The most bytes one datagram carries: 1432 fits an Ethernet frame with the IP
+		// and UDP headers; 8932 suits jumbo frames, 65507 a loopback server.
+		packetSize   int                 = 1432
+		// How long a connect or a write may wait.
+		timeout      duration            = 5s
+
+		internal scheme string
+		internal target string
+		internal socket ?net.Socket     = none
+		internal stream ?net.Connection = none
+		internal counts Totals
+
+		// address is `udp://host:port` (port 8125 when left out), `tcp://host:port`,
+		// `unix:///path` (stream) or `unixgram:///path` (datagram).
+		def new(address string = "udp://127.0.0.1:8125") {
+			let cut = address.indexOf("://")
+			scheme = cut < 0 ?? ("udp", address[:cut])
+			target = cut < 0 ?? (address, address[cut + 3:])
+			target = net.withPort(target, 8125) when scheme := "udp" || "tcp"
+			counts = new Totals()
+		}
+
+		// Name implements Exporter: `statsd` and the address.
+		def name() string {
+			return "statsd {scheme}://{target}"
+		}
+
+		// Export implements Exporter.
+		//
+		// Fails with an ExportFailure when the server cannot be reached or a write fails;
+		// the batch is kept for another try.
+		def export(batch TelemetryBatch) !none {
+			return none when batch.metrics.len() == 0
+			let shared = tags.clone()
+			for let key in resourceTags {
+				let value = batch.resource.get(key)
+				shared[key] = value unless value is none
+			}
+			let lines = string[]
+			let readings = Reading[]
+			for let sample in batch.metrics {
+				for let line in linesOf(sample, shared, readings) {
+					lines.push(line)
+				}
+			}
+			send(lines) onerror (err error) {
+				let cause = StatsDError{message: "statsd: {scheme}://{target}: {err.message}", code: "Unreachable", cause: err}
+				fail ExportFailure{message: cause.message, cause: cause, rest: TelemetryBatch{resource: batch.resource, metrics: batch.metrics}}
+			}
+			counts.commit(readings)
+			return none
+		}
+
+		// The lines of one sample; counter and histogram readings go into readings, to
+		// become the base once sent.
+		internal def linesOf(sample MetricSample, shared map<string, string>, readings Reading[]) string[] {
+			let lines = string[]
+			let labels = shared.clone()
+			for let (key, value) in sample.labels {
+				labels[key] = value
+			}
+			let name = prefix + metricName(sample.name)
+			switch sample.kind {
+				case "counter":
+					let reading = Reading{key: keyOf(sample), count: sample.count}
+					let previous = counts.last(reading.key)
+					let added = reading.count
+					added = reading.count - previous.count when !(previous is none) && previous.count <= reading.count
+					readings.push(reading)
+					lines.push(lineOf(tagStyle, name, "{added}", "c", "", labels))
+				case "gauge", "toggle":
+					let value = sample.kind == "toggle" ?? (sample.value > 0.0 ?? (1.0, 0.0), sample.value)
+					lines.push(lineOf(tagStyle, name, "0", "g", "", labels)) when value < 0.0
+					lines.push(lineOf(tagStyle, name, shortest(value), "g", "", labels))
+				case "histogram":
+					let spread = sample.distribution
+					return lines when spread is none
+					let reading = Reading{key: keyOf(sample), count: spread.count, ranges: rangesOf(spread)}
+					let previous = counts.last(reading.key)
+					readings.push(reading)
+					let (scale, kind) = timerScale(sample.unit)
+					let ranges = reading.ranges.keys()
+					ranges.sort((a, b) => a < b)
+					for let at in ranges {
+						let now = reading.ranges.get(at)
+						continue when now is none
+						let before = (previous is none || previous.count > reading.count) ?? (none, previous.ranges.get(at))
+						let added = before is none ?? (now, now > before ?? (now - before, uint64(0)))
+						continue when added == uint64(0)
+						let rate = added == uint64(1) ?? ("", shortest(1.0 / float64(added)))
+						lines.push(lineOf(tagStyle, name, shortest(middleOf(at) * scale), kind, rate, labels))
+					}
+			}
+			return lines
+		}
+
+		// Sends lines: packed into datagrams, or each on a line of the stream. Fails when
+		// the server cannot be reached or a write fails.
+		internal def send(lines string[]) !none {
+			return none when lines.len() == 0
+			if scheme := "tcp" || "unix" {
+				let text = lines.join("\n") + "\n"
+				let failed = false
+				writeAll(try connected(), text.bytes()) onerror (err error) {
+					failed = true
+					recover none
+				}
+				return none unless failed
+				drop()
+				return try writeAll(try connected(), text.bytes())
+			}
+			let packet = ""
+			for let line in lines {
+				if !packet.isEmpty() && packet.len() + 1 + line.len() > packetSize {
+					try datagram(packet)
+					packet = ""
+				}
+				packet = packet.isEmpty() ?? (line, packet + "\n" + line)
+			}
+			try datagram(packet) unless packet.isEmpty()
+			return none
+		}
+
+		internal def datagram(packet string) !none {
+			let held = socket
+			let open = held
+			if held is none {
+				try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "statsd://" + target) unless scheme == "unixgram"
+				let domain = scheme == "unixgram" ?? (net.SocketDomain.Unix, (target.startsWith("[") ?? (net.SocketDomain.IPv6, net.SocketDomain.IPv4)))
+				let made = try net.socket(domain, net.SocketType.Datagram)
+				socket = made
+				open = made
+			}
+			try open.writeTo(packet.bytes(), target, timeout) unless open is none
+			return none
+		}
+
+		// The stream, connected on first use.
+		internal def connected() !net.Connection {
+			let held = stream
+			return held unless held is none
+			try Policy.validate("adm.network.connect", "std.services.policy.EndpointSpec", "statsd://" + target) when scheme == "tcp"
+			let made = try net.dialStream(target, timeout)
+			stream = made
+			return made
+		}
+
+		internal def writeAll(conn net.Connection, data byte[]) !none {
+			let at = 0
+			for at < data.len() {
+				let wrote = try conn.write(data[at:], timeout)
+				fail StatsDError{message: "statsd: the stream took no bytes", code: "ShortWrite"} when wrote <= 0
+				at += wrote
+			}
+			return none
+		}
+
+		internal def drop() {
+			let held = stream
+			if !(held is none) {
+				held.close() onerror recover none
+			}
+			stream = none
+			let dgram = socket
+			if !(dgram is none) {
+				dgram.close() onerror recover none
+			}
+			socket = none
+		}
+
+		// Close implements Exporter: closes the socket. Does not fail.
+		def close() !none {
+			drop()
+			return none
+		}
+	}
+
+	// One line in a tag style.
+	internal def lineOf(tagStyle TagStyle, name string, value string, kind string, rate string, labels map<string, string>) string {
+		let keys = labels.keys()
+		keys.sort((a, b) => a < b)
+		let pairs = string[]
+		let named = name
+		for let key in keys {
+			let tagValue = labels.get(key)
+			continue when tagValue is none
+			switch tagStyle {
+				case TagStyle.DogStatsD:
+					pairs.push("{tagText(key)}:{tagText(tagValue)}")
+				case TagStyle.Influx, TagStyle.Graphite:
+					pairs.push("{tagText(key)}={tagText(tagValue)}")
+				default:
+					named += ".{tagText(key)}_{tagText(tagValue)}"
+			}
+		}
+		let sampled = rate.isEmpty() ?? ("", "|@{rate}")
+		switch tagStyle {
+			case TagStyle.DogStatsD:
+				return "{named}:{value}|{kind}{sampled}" + (pairs.len() == 0 ?? ("", "|#" + pairs.join(",")))
+			case TagStyle.Influx:
+				return "{named}" + (pairs.len() == 0 ?? ("", "," + pairs.join(","))) + ":{value}|{kind}{sampled}"
+			case TagStyle.Graphite:
+				return "{named}" + (pairs.len() == 0 ?? ("", ";" + pairs.join(";"))) + ":{value}|{kind}{sampled}"
+			default:
+				return "{named}:{value}|{kind}{sampled}"
+		}
+	}
+
+	// A counter's total or a histogram's counts by range, as last sent.
+	internal struct Reading {
+		key    string
+		count  uint64
+		ranges map<int, uint64>
+	}
+
+	// What counters and histograms stood at when last sent: StatsD takes what was added.
+	internal type Totals {
+		internal held map<string, Reading>
+
+		def new() {}
+
+		atomic def last(key string) ?Reading {
+			return held.get(key)
+		}
+
+		atomic def commit(readings Reading[]) {
+			for let reading in readings {
+				held[reading.key] = reading
+			}
+		}
+	}
+
+	// A series' identity: its name and labels in order of name.
+	internal def keyOf(sample MetricSample) string {
+		let names = sample.labels.keys()
+		names.sort((a, b) => a < b)
+		let key = sample.name
+		for let name in names {
+			let value = sample.labels.get(name)
+			key += "\x01{name}={value}" unless value is none
+		}
+		return key
+	}
+
+	// A name with the characters StatsD lines reserve (`:`, `|`, `@`, `#`, `,`, `;`,
+	// `=`, white space) replaced by `_`.
+	internal def metricName(name string) string {
+		let out = ""
+		for let c in name {
+			out += (c := ':' || '|' || '@' || '#' || ',' || ';' || '=' || ' ' || '\n' || '\t' || '\r') ?? ("_", "{c}")
+		}
+		return out
+	}
+
+	// A tag key or value with the reserved characters replaced by `_`.
+	internal def tagText(text string) string {
+		return metricName(text)
+	}
+
+	// How a histogram of unit goes: time units as `ms` with the factor to milliseconds,
+	// others as `h` unscaled.
+	internal def timerScale(unit string) (float64, string) {
+		switch unit {
+			case "ns":
+				return (0.000001, "ms")
+			case "us":
+				return (0.001, "ms")
+			case "ms":
+				return (1.0, "ms")
+			case "s":
+				return (1000.0, "ms")
+			case "min":
+				return (60000.0, "ms")
+			case "h":
+				return (3600000.0, "ms")
+			default:
+				return (1.0, "h")
+		}
+	}
+
+	// A histogram's counts by range, from the bound above the first, or the mean when it
+	// fills one range.
+	internal def rangesOf(spread Distribution) map<int, uint64> {
+		let out = map<int, uint64>{}
+		return out when spread.counts.len() == 0
+		let first = 0
+		if spread.bounds.len() > 0 {
+			first = int((math.log2(float(spread.bounds[0])) * float(rangesPerDoubling)).round()) + rangeShift
+		} else {
+			let mean = spread.count == 0 ?? (0.0, spread.sum / float64(spread.count))
+			first = 0
+			if mean > 0.0 {
+				first = int((math.log2(float(mean)) * float(rangesPerDoubling)).ceil()) + rangeShift
+				first = first < 0 ?? (0, first > topRange ?? (topRange, first))
+			}
+		}
+		for let (i, n) in spread.counts {
+			out[first + i] = n unless n == 0
+		}
+		return out
+	}
+
+	// The middle of a range on a log scale; 0 for range 0, its bound for the top one.
+	internal def middleOf(at int) float64 {
+		return 0.0 when at <= 0
+		return float64(2.0 ** (float(at - rangeShift) / float(rangesPerDoubling))) when at >= topRange
+		return float64(2.0 ** ((float(at - rangeShift) - 0.5) / float(rangesPerDoubling)))
+	}
+
+	// A float in the shortest text that reads back as the same value.
+	internal def shortest(value float64) string {
+		for let digits = 1; digits < 17; digits++ {
+			let text = "%.{digits}g".format(value)
+			return text when parseFloat<float64>(text) == value
+		}
+		return "%.17g".format(value)
+	}
+}

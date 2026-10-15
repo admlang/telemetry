@@ -10,6 +10,9 @@ with the vendor, so each is a library, written in ADM over `std.net.http`, publi
 |---|---|---|
 | [`adm.telemetry.datadog`](datadog/) | Datadog | metrics (series and distributions), logs, events, traces |
 | [`adm.telemetry.sentry`](sentry/) | Sentry, GlitchTip and self-hosted servers | errors as events with stack traces, spans as transactions, check-ins for crons |
+| [`adm.telemetry.prometheus`](prometheus/) | Prometheus and servers that take its formats | metrics, pushed by Remote Write or to a Pushgateway, or served for scraping on a private listener |
+| [`adm.telemetry.statsd`](statsd/) | Graphite, Telegraf, Netdata and other StatsD servers | metrics as StatsD lines |
+| [`adm.telemetry.graylog`](graylog/) | Graylog | log records as GELF messages, through the `Logging` service |
 
 A vendor that takes OTLP (Honeycomb, Grafana Cloud, New Relic, Dynatrace, Elastic) needs no
 library: point the service's `OTLPExporter` at its endpoint with its headers.

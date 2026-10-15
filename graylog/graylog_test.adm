@@ -1,0 +1,202 @@
+partial module adm.telemetry.graylog {
+	use (
+		std.bytes::(Buffer)
+		std.data.compress.gzip
+		std.data.compress.zlib
+		std.data.encoding::(JSON)
+		std.io
+		std.net
+		std.net.http
+		std.net.http.httptest
+		std.services.logging::(LogConfig, LogLevel, LogRecord, LogWriterConfig, Logging)
+		std.testing
+	)
+
+	// A GELF input for the live test (`udp://host:12201`), which gets messages from the
+	// source `adm-test`.
+	@env("ADM_TEST_GRAYLOG")
+	internal const liveInput string
+
+	// The datagrams that arrive within a short wait.
+	internal def datagrams(server net.Socket) byte[][] {
+		let out = byte[][]
+		let buf = byte[]
+		buf.len(65536)
+		for {
+			let (n, _) = server.readFrom(buf, 300ms) onerror (err error) {
+				return out
+			}
+			out.push(byte[] + buf[:n])
+		}
+		return out
+	}
+
+	internal def objectOf(data byte[]) !map<string, any> {
+		let value = try (new JSON()).parse(data)
+		return value when value is map<string, any>
+		fail "not a JSON object"
+	}
+
+	internal def udpServer() !net.Socket {
+		let server = try net.socket(net.SocketDomain.IPv4, net.SocketType.Datagram)
+		try server.bind("127.0.0.1:0")
+		return server
+	}
+
+	// An HTTP GELF input that keeps the bodies, unpacked.
+	internal type FakeInput {
+		bodies byte[][]
+
+		def serve(ctx http.Context) !none {
+			let body = try ctx.bytes()
+			body = try io.readAll(new gzip.Reader(new Buffer(body))) when ctx.request.headers.get("Content-Encoding") == "gzip"
+			bodies.push(body)
+			return try ctx.text(202, "")
+		}
+	}
+
+	check "Graylog GELF" {
+		@test()
+		def encodesGelf() !none {
+			let encoder = new Encoder()
+			encoder.host = "web-1"
+			encoder.fields = {"env": "prod"}
+			let record = LogRecord{level: LogLevel.Warning, message: "card slow\nretrying", fields: {"ms": 900, "ok": true, "id": "x", "order no": "7", "list": [1, 2]}, time: 1500000000, trace: "4bf92f3577b34da6a3ce929d0e0e4736", span: "00f067aa0ba902b7"}
+			let gelf = try objectOf(try encoder.encode(record))
+			try testing.expectEqual("1.1", "{gelf["version"]}", "GELF 1.1")
+			try testing.expectEqual("web-1", "{gelf["host"]}", "the host")
+			try testing.expectEqual("card slow", "{gelf["short_message"]}", "the first line")
+			try testing.expectEqual("card slow\nretrying", "{gelf["full_message"]}", "and the whole message")
+			try testing.expectEqual(4, int(gelf["level"]), "warning is 4")
+			try testing.expectEqual("4bf92f3577b34da6a3ce929d0e0e4736", "{gelf["_trace_id"]}", "the trace")
+			try testing.expectEqual(900, int(gelf["_ms"]), "a number stays a number")
+			try testing.expectEqual("true", "{gelf["_ok"]}", "a bool becomes text")
+			try testing.expectEqual("x", "{gelf["_id_"]}", "_id is reserved")
+			try testing.expectEqual("7", "{gelf["_order_no"]}", "names take GELF's characters")
+			try testing.expectEqual("[1,2]", "{gelf["_list"]}", "other values as JSON")
+			try testing.expectEqual("prod", "{gelf["_env"]}", "the encoder's fields")
+			let plain = try objectOf(try encoder.encode(LogRecord{message: "hi", time: 1}))
+			try testing.expectEqual(5, int(plain["level"]), "a record without a level is notice")
+			try testing.expectFalse(plain.hasKey("full_message"), "one line has no full message")
+			return none
+		}
+
+		@test()
+		def udpChunks() !none {
+			let server = try udpServer()
+			let writer = new Writer("udp://{server.localAddr().str()}")
+			writer.compression = Compression.None
+			try writer.write("\{\"short_message\":\"small\"}".bytes())
+			let got = datagrams(server)
+			try testing.expectEqual("\{\"short_message\":\"small\"}", string(got[0]), "a small message is one datagram")
+
+			writer.compression = Compression.Gzip
+			writer.chunkSize = 100
+			let big = ""
+			for let i = 0; i < 400; i++ {
+				big += "{(i * 7919) % 1000}-"
+			}
+			let message = "\{\"short_message\":\"{big}\"}".bytes()
+			try writer.write(message)
+			let chunks = datagrams(server)
+			try testing.expectTrue(chunks.len() > 1, "a large message is chunked")
+			let count = int(chunks[0][11])
+			try testing.expectEqual(chunks.len(), count, "every chunk counted")
+			let parts = byte[][]
+			parts.len(count)
+			for let chunk in chunks {
+				try testing.expectTrue(chunk[0] == byte(0x1e) && chunk[1] == byte(0x0f), "the chunk magic")
+				try testing.expectTrue(chunk.len() <= 100, "within chunkSize")
+				try testing.expectEqual(string(chunks[0][2:10]), string(chunk[2:10]), "one message id")
+				parts[int(chunk[10])] = chunk[12:]
+			}
+			let joined = byte[]
+			for let part in parts {
+				joined = joined + part
+			}
+			let unpacked = try io.readAll(new gzip.Reader(new Buffer(joined)))
+			try testing.expectEqual(string(message), string(unpacked), "the chunks join and unpack to the message")
+
+			writer.compression = Compression.Zlib
+			writer.chunkSize = 8192
+			try writer.write(message)
+			let one = datagrams(server)
+			try testing.expectEqual(string(message), string(try io.readAll(new zlib.Reader(new Buffer(one[0])))), "zlib")
+
+			writer.compression = Compression.None
+			writer.chunkSize = 20
+			let tooLarge = false
+			writer.write(message) onerror (err error) {
+				tooLarge = err is GraylogError
+				recover 0
+			}
+			try testing.expectTrue(tooLarge, "more than 128 chunks fail")
+			try writer.close()
+			try server.close()
+			return none
+		}
+
+		@test()
+		def tcpAndHttp() !none {
+			let listener = try net.socket(net.SocketDomain.IPv4, net.SocketType.Stream)
+			try listener.bind("127.0.0.1:0")
+			let ln = try listener.listen(2)
+			let writer = new Writer("tcp://{ln.address().str()}")
+			try writer.write("\{\"a\":1}".bytes())
+			try writer.write("\{\"b\":2}".bytes())
+			let conn = try ln.accept()
+			let buf = byte[]
+			buf.len(4096)
+			let got = byte[]
+			for got.len() < 16 {
+				let n = try conn.read(buf, 2s)
+				break when n == 0
+				got = got + buf[:n]
+			}
+			try testing.expectEqual("\{\"a\":1}\x00\{\"b\":2}\x00", string(got), "null-terminated, uncompressed")
+			try conn.close()
+			try ln.close()
+			try writer.close()
+
+			let input = new FakeInput()
+			let server = try httptest.Server.start(input)
+			let poster = new Writer(server.url + "/gelf")
+			try poster.write("\{\"short_message\":\"over http\"}".bytes())
+			try testing.expectEqual("\{\"short_message\":\"over http\"}", string(input.bodies[0]), "posted, gzip on the wire")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def throughLogging() !none {
+			let server = try udpServer()
+			let writer = new Writer("udp://{server.localAddr().str()}")
+			writer.compression = Compression.None
+			let encoder = new Encoder()
+			encoder.host = "adm-test"
+			try Logging.config(LogConfig{level: LogLevel.Debug, writers: [LogWriterConfig{writer: writer, encoder: encoder}]})
+			Logging.warning("disk almost full", {"free": 3})
+			try Logging.flush()
+			let got = datagrams(server)
+			try testing.expectEqual(1, got.len(), "one message")
+			let gelf = try objectOf(got[0])
+			try testing.expectEqual("disk almost full", "{gelf["short_message"]}", "the record")
+			try testing.expectEqual(3, int(gelf["_free"]), "its field")
+			try testing.expectTrue("{gelf["_file"]}".endsWith("graylog_test.adm"), "where it was written")
+			try Logging.config(LogConfig{})
+			try server.close()
+			return none
+		}
+
+		@test()
+		def liveInputTakesMessages() !none {
+			return none when liveInput.isEmpty()
+			let writer = new Writer(liveInput)
+			let encoder = new Encoder()
+			encoder.host = "adm-test"
+			try writer.write(try encoder.encode(LogRecord{level: LogLevel.Info, message: "adm-test message", fields: {"n": 1}}))
+			try writer.close()
+			return none
+		}
+	}
+}

@@ -1,0 +1,154 @@
+partial module adm.telemetry.sentry {
+	use (
+		std.time
+	)
+
+	// The pause a 429 with neither `X-Sentry-Rate-Limits` nor `Retry-After` stands for.
+	internal const defaultPause = 60s
+
+	// The longest pause a server is granted.
+	internal const longestPause = 1h
+
+	// The rate-limit categories the exporter sends in, and the client-report reasons it
+	// records drops under.
+	internal const (
+		categoryError       = "error"
+		categoryTransaction = "transaction"
+		categorySpan        = "span"
+		categoryLog         = "log_item"
+		categoryLogBytes    = "log_byte"
+		categoryMonitor     = "monitor"
+	)
+
+	// What the server's rate limits allow, and what was dropped meanwhile.
+	internal type Limits {
+		// Wall-clock nanoseconds until which each category is paused; `*` for all.
+		internal until     map<string, int64>
+		// Drops not reported yet, by `reason|category`.
+		internal discarded map<string, int>
+
+		def new() {}
+
+		// Whether sending in category is paused now.
+		atomic def paused(category string) bool {
+			let now = time.wallNs()
+			let all = until.get("*")
+			return true when !(all is none) && all > now
+			let one = until.get(category)
+			return !(one is none) && one > now
+		}
+
+		// How long until every category is allowed again; 0s when none is paused.
+		atomic def longest() duration {
+			let now = time.wallNs()
+			let most = int64(0)
+			for let (_, end) in until {
+				most = end - now when end - now > most
+			}
+			return duration(most)
+		}
+
+		// Reads `X-Sentry-Rate-Limits` and, on a 429 without it, `Retry-After`. Returns
+		// the longest pause it set.
+		atomic def learn(status int, header string, retryAfter string) duration {
+			let now = time.wallNs()
+			let most = 0s
+			if !header.trim().isEmpty() {
+				for let entry in header.split(",") {
+					let parts = entry.replace(" ", "").split(":")
+					continue when parts.len() < 2 || !/^[0-9]+$/.test(parts[0])
+					let pause = bounded(duration(parts[0].toInt<int64>() * 1000000000))
+					let categories = parts[1].isEmpty() ?? (string[], parts[1].split(";"))
+					if categories.len() == 0 {
+						hold("*", now + int64(pause))
+					} else {
+						let known = categories.filter(c => isCategory(c))
+						// A limit naming no category this exporter knows is ignored.
+						continue when known.len() == 0
+						for let c in known {
+							hold(c, now + int64(pause))
+						}
+					}
+					most = pause when pause > most
+				}
+				return most
+			}
+			return 0s unless status == 429
+			let pause = pauseOf(retryAfter)
+			pause = defaultPause when pause == 0s
+			hold("*", now + int64(pause))
+			return pause
+		}
+
+		// Records that quantity items of category were dropped for reason.
+		atomic def drop(reason string, category string, quantity int) {
+			return when quantity <= 0
+			let key = "{reason}|{category}"
+			discarded[key] = (discarded.hasKey(key) ?? (discarded[key], 0)) + quantity
+		}
+
+		// The drops recorded so far, by `reason|category`; they are taken, so each is
+		// reported once.
+		atomic def take() map<string, int> {
+			let taken = discarded
+			discarded = map<string, int>{}
+			return taken
+		}
+
+		// Puts back drops taken for a report that was not sent.
+		atomic def restore(counts map<string, int>) {
+			for let (key, quantity) in counts {
+				discarded[key] = (discarded.hasKey(key) ?? (discarded[key], 0)) + quantity
+			}
+		}
+
+		internal def hold(category string, end int64) {
+			let held = until.get(category)
+			// The longest of two limits on one category stands.
+			until[category] = end when held is none || end > held
+		}
+	}
+
+	// The client report of counts, by `reason|category`.
+	internal def reportOf(counts map<string, int>) map<string, any> {
+		let entries = any[]
+		for let (key, quantity) in counts {
+			let cut = key.indexOf("|")
+			entries.push({"reason": key[:cut], "category": key[cut + 1:], "quantity": quantity})
+		}
+		return {"timestamp": seconds(wallNow()), "discarded_events": entries}
+	}
+
+	// Whether category is one the exporter sends in.
+	internal def isCategory(name string) bool {
+		return name := categoryError || categoryTransaction || categorySpan || categoryLog || categoryMonitor || "default"
+	}
+
+	// A pause within what a server is granted.
+	internal def bounded(pause duration) duration {
+		return 0s when pause < 0s
+		return pause > longestPause ?? (longestPause, pause)
+	}
+
+	// The pause a `Retry-After` header asks for: seconds, or a date to wait until. 0s when
+	// the header is absent or says neither.
+	internal def pauseOf(header string) duration {
+		let text = header.trim()
+		return 0s when text.isEmpty()
+		return bounded(duration(text.toInt<int64>() * 1000000000)) when /^[0-9]{1,9}$/.test(text)
+		let until = time.parseHTTPDate(text) onerror (err error) {
+			return 0s
+		}
+		return bounded(until - time.now())
+	}
+
+	// Wall-clock nanoseconds since the Unix epoch, now.
+	internal def wallNow() int64 {
+		return time.wallNs()
+	}
+
+	// Wall-clock nanoseconds as the seconds Sentry's timestamps count.
+	internal def seconds(ns int64) float64 {
+		return float64(ns) / 1000000000.0
+	}
+}

@@ -1,0 +1,282 @@
+partial module adm.telemetry.sentry {
+	use (
+		std.crypto
+		std.data.encoding::(JSON)
+		std.services.logging::(LogLevel, LogRecord)
+		std.services.telemetry::(ErrorReport, SpanEvent, UsageEvent)
+	)
+
+	// What every event of one batch shares: who sends it and where it runs.
+	internal struct Scope {
+		release      string
+		environment  string
+		serverName   string
+		// The exporter's tags and the resource attributes that are not contexts.
+		tags         map<string, string>
+		contexts     map<string, any>
+		// The user an event names when its fields name none: the installation id.
+		installation string
+	}
+
+	// One breadcrumb: a log record, a usage event or a span event before an error.
+	internal struct Crumb {
+		time  int64
+		value map<string, any>
+	}
+
+	// The longest a tag key or value may be; Sentry drops a longer one.
+	internal const tagLength = 200
+
+	// The resource attributes that go into contexts rather than tags.
+	internal const contextKeys = ["service.name", "service.version", "os.type", "host.arch", "host.name", "deployment.environment", "deployment.environment.name"]
+
+	// The fields of an error report that fill the user and request interfaces.
+	internal const userFields = ["user.id", "user.email", "user.name", "client.address"]
+	internal const requestFields = ["url.full", "http.request.method", "url.query"]
+
+	// A new event id: 32 hexadecimal digits.
+	internal def eventId() string {
+		return (new crypto.UUID()).str().replace("-", "")
+	}
+
+	// What the SDK interface and the envelope header say about the sender.
+	internal def sdkInfo() map<string, any> {
+		return {"name": sdkName, "version": sdkVersion}
+	}
+
+	// The scope of a batch with resource, under the exporter's settings.
+	internal def scopeOf(resource map<string, string>, release string, environment string, serverName string, tags map<string, string>) Scope {
+		let made = Scope{release: release, environment: environment, serverName: serverName, installation: entryOf(resource, "app.installation.id")}
+		let program = entryOf(resource, "service.name")
+		let version = entryOf(resource, "service.version")
+		made.release = "{program}@{version}" when made.release.isEmpty() && !program.isEmpty() && !version.isEmpty()
+		made.environment = entryOf(resource, "deployment.environment.name", entryOf(resource, "deployment.environment", "production")) when made.environment.isEmpty()
+		made.serverName = entryOf(resource, "host.name") when made.serverName.isEmpty()
+		made.contexts = {
+			"os":      {"name": entryOf(resource, "os.type")},
+			"device":  {"arch": entryOf(resource, "host.arch")},
+			"runtime": {"name": "adm"},
+			"app":     {"app_name": program, "app_version": version},
+		}
+		for let (key, value) in resource {
+			continue when contextKeys.includes(key) || key == "app.installation.id"
+			made.tags[clip(key, tagLength)] = clip(value, tagLength)
+		}
+		for let (key, value) in tags {
+			made.tags[clip(key, tagLength)] = clip(value, tagLength)
+		}
+		return made
+	}
+
+	// The event of an error report, with the breadcrumbs before it.
+	internal def errorEvent(id string, report ErrorReport, scope Scope, crumbs Crumb[], fingerprint string[]) map<string, any> {
+		let event = baseEvent(id, scope, report.time)
+		event["level"] = report.fatal ?? ("fatal", "error")
+		event["logger"] = "adm"
+		let tags = scope.tags.clone()
+		tags["error.code"] = clip(report.code, tagLength) unless report.code.isEmpty()
+		event["tags"] = tags
+		if report.stack.frames.len() == 0 {
+			event["logentry"] = {"formatted": report.message}
+		} else {
+			let kind = report.kind == "error" && !report.code.isEmpty() ?? (report.code, report.kind)
+			let exception = {
+				"type":       kind,
+				"value":      report.message,
+				"mechanism":  {"type": "generic", "handled": !report.fatal},
+				"stacktrace": {"frames": framesOf(report)},
+			}
+			event["exception"] = {"values": [exception]}
+		}
+		let contexts = scope.contexts.clone()
+		let within = report.span
+		contexts["trace"] = {"trace_id": within.trace, "span_id": within.span} unless (within is none)
+		event["contexts"] = contexts
+		let extra = map<string, any>{}
+		let user = map<string, any>{}
+		let request = map<string, any>{}
+		for let (key, value) in report.fields {
+			if userFields.includes(key) {
+				user[key == "client.address" ?? ("ip_address", key[5:])] = "{value}"
+			} else if requestFields.includes(key) {
+				let named = key == "url.full" ?? ("url", key == "url.query" ?? ("query_string", "method"))
+				request[named] = "{value}"
+			} else {
+				extra[key] = value
+			}
+		}
+		user["id"] = scope.installation when !user.hasKey("id") && !scope.installation.isEmpty()
+		event["user"] = user unless user.len() == 0
+		event["request"] = request unless request.len() == 0
+		event["extra"] = extra unless extra.len() == 0
+		event["fingerprint"] = fingerprint unless fingerprint.len() == 0
+		let shown = crumbs.filter(c => c.time <= report.time)
+		event["breadcrumbs"] = {"values": shown.mapElem(c => c.value)} when shown.len() > 0
+		return event
+	}
+
+	// What every event carries; id is its event id.
+	internal def baseEvent(id string, scope Scope, time int64) map<string, any> {
+		let event = map<string, any>{
+			"event_id":  id,
+			"timestamp": seconds(time == 0 ?? (wallNow(), time)),
+			"platform":  "other",
+			"sdk":       sdkInfo(),
+		}
+		event["release"] = scope.release unless scope.release.isEmpty()
+		event["environment"] = scope.environment unless scope.environment.isEmpty()
+		event["server_name"] = scope.serverName unless scope.serverName.isEmpty()
+		return event
+	}
+
+	// The frames of an error's stack, caller first as Sentry orders them (the order the
+	// runtime records). A stack too long keeps 500 frames at each end.
+	internal def framesOf(report ErrorReport) any[] {
+		let all = report.stack.frames
+		let frames = any[]
+		for let (i, frame) in all {
+			continue when all.len() > 1000 && i >= 500 && i < all.len() - 500
+			let made = map<string, any>{"function": frame.name, "in_app": inApp(frame.name)}
+			let at = frame.location
+			if !at.file.isEmpty() {
+				let cut = at.file.lastIndexOf("/")
+				made["filename"] = cut < 0 ?? (at.file, at.file[cut + 1:])
+				made["abs_path"] = at.file
+			}
+			made["lineno"] = at.line when at.line > 0
+			made["colno"] = at.column when at.column > 0
+			frames.push(made)
+		}
+		return frames
+	}
+
+	// Whether a frame is the application's own code: not the standard library's, nor an
+	// installed library's.
+	internal def inApp(name string) bool {
+		return !(name.startsWith("std.") || name.startsWith("adm.") || name.startsWith("builtin."))
+	}
+
+	// The breadcrumb of a log record.
+	internal def logCrumb(entry LogRecord) Crumb {
+		let crumb = map<string, any>{
+			"timestamp": seconds(entry.time == 0 ?? (wallNow(), entry.time)),
+			"type":      "default",
+			"category":  "log",
+			"level":     crumbLevel(entry.level),
+			"message":   entry.message,
+		}
+		crumb["data"] = entry.fields unless entry.fields.len() == 0
+		return Crumb{time: entry.time, value: crumb}
+	}
+
+	// The breadcrumb of a usage event.
+	internal def usageCrumb(used UsageEvent) Crumb {
+		let crumb = map<string, any>{
+			"timestamp": seconds(used.time),
+			"type":      "user",
+			"category":  used.name,
+			"level":     "info",
+		}
+		crumb["data"] = used.properties unless used.properties.len() == 0
+		return Crumb{time: used.time, value: crumb}
+	}
+
+	// The breadcrumb of something that happened inside a span.
+	internal def spanCrumb(happened SpanEvent) Crumb {
+		let crumb = map<string, any>{
+			"timestamp": seconds(happened.time),
+			"type":      "default",
+			"category":  "span.event",
+			"level":     "info",
+			"message":   happened.name,
+		}
+		crumb["data"] = happened.attributes unless happened.attributes.len() == 0
+		return Crumb{time: happened.time, value: crumb}
+	}
+
+	// A record's level as a breadcrumb's.
+	internal def crumbLevel(level ?LogLevel) string {
+		return "info" when level is none
+		switch level {
+			case LogLevel.Debug:
+				return "debug"
+			case LogLevel.Warning:
+				return "warning"
+			case LogLevel.Error:
+				return "error"
+			case LogLevel.Fatal:
+				return "fatal"
+			default:
+				return "info"
+		}
+	}
+
+	// A record's level as a Sentry log's, and its severity number (the lowest of its range).
+	internal def logLevel(level ?LogLevel) (string, int) {
+		return ("info", 9) when level is none
+		switch level {
+			case LogLevel.Debug:
+				return ("debug", 5)
+			case LogLevel.Warning:
+				return ("warn", 13)
+			case LogLevel.Error:
+				return ("error", 17)
+			case LogLevel.Fatal:
+				return ("fatal", 21)
+			default:
+				return ("info", 9)
+		}
+	}
+
+	// A log record as one entry of a Sentry `log` item. trace stands in for the trace id
+	// of a record written outside any span, which Sentry requires.
+	internal def logEntry(entry LogRecord, scope Scope, trace string) map<string, any> {
+		let (level, severity) = logLevel(entry.level)
+		let made = map<string, any>{
+			"timestamp":       seconds(entry.time == 0 ?? (wallNow(), entry.time)),
+			"trace_id":        entry.trace.isEmpty() ?? (trace, entry.trace),
+			"level":           level,
+			"severity_number": severity,
+			"body":            entry.message,
+		}
+		made["span_id"] = entry.span unless entry.span.isEmpty()
+		let attributes = map<string, any>{
+			"sentry.sdk.name":    typed(sdkName),
+			"sentry.sdk.version": typed(sdkVersion),
+		}
+		attributes["sentry.environment"] = typed(scope.environment) unless scope.environment.isEmpty()
+		attributes["sentry.release"] = typed(scope.release) unless scope.release.isEmpty()
+		attributes["server.address"] = typed(scope.serverName) unless scope.serverName.isEmpty()
+		let caller = entry.caller
+		attributes["code.file.path"] = typed(caller.filePath) unless caller.filePath.isEmpty()
+		attributes["code.line.number"] = typed(caller.line) when caller.line > 0
+		attributes["code.function.name"] = typed(caller.name) unless caller.name.isEmpty()
+		for let (key, value) in entry.fields {
+			attributes[key] = typed(value)
+		}
+		made["attributes"] = attributes
+		return made
+	}
+
+	// An attribute value with the type Sentry logs declare: `string`, `boolean`,
+	// `integer` or `double`; anything else as its JSON text.
+	internal def typed(value any) map<string, any> {
+		return {"value": value, "type": "boolean"} when value is bool
+		return {"value": value, "type": "integer"} when value is int || value is int64 || value is int32 || value is int16 || value is int8 || value is uint || value is uint64 || value is uint32 || value is uint16 || value is uint8
+		return {"value": value, "type": "double"} when value is float || value is float64 || value is float32
+		return {"value": value, "type": "string"} when value is string
+		return {"value": string((new JSON()).encode(value)), "type": "string"}
+	}
+
+	// The entry of key, fallback when there is none.
+	internal def entryOf(entries map<string, string>, key string, fallback string = "") string {
+		let found = entries.get(key)
+		return fallback when found is none
+		return found
+	}
+
+	// text cut to at most length characters.
+	internal def clip(text string, length int) string {
+		return text.len() > length ?? (text[:length], text)
+	}
+}

@@ -1,0 +1,11 @@
+// GELF log encoder and writer for Graylog
+@manifest(version = "0.1.0")
+library adm.telemetry.graylog {
+	use (
+		adm.telemetry.graylog
+	)
+
+	export (
+		adm.telemetry.graylog
+	)
+}

@@ -1,0 +1,554 @@
+partial module adm.telemetry.sentry {
+	use (
+		std.bytes::(Buffer)
+		std.data.compress.gzip
+		std.data.encoding::(JSON)
+		std.io
+		std.net.http
+		std.net.http.httptest
+		std.services.logging::(LogLevel, LogRecord)
+		std.services.telemetry::(ErrorReport, ExportFailure, SpanContext, SpanEvent, SpanRecord, TelemetryBatch, UsageEvent)
+		std.testing
+	)
+
+	// A DSN for the live test, whose project receives what the suite sends.
+	@env("ADM_TEST_SENTRY_DSN")
+	internal const liveDsn string
+
+	// One item of an envelope.
+	internal struct Item {
+		header  map<string, any>
+		payload map<string, any>
+	}
+
+	// One envelope the test server received.
+	internal struct Envelope {
+		header   map<string, any>
+		items    Item[]
+		auth     string
+		kind     string
+		encoding string
+		// What the server answered.
+		status   int
+	}
+
+	// A Sentry server on loopback: keeps every envelope and answers with the statuses
+	// and headers queued, else 200.
+	internal type FakeSentry {
+		received Envelope[]
+		statuses int[]
+		limits   string[]
+
+		// Serve implements http.Handler.
+		def serve(ctx http.Context) !none {
+			let body = try ctx.bytes()
+			let encoding = ctx.request.headers.get("Content-Encoding")
+			body = try io.readAll(new gzip.Reader(new Buffer(body))) when encoding == "gzip"
+			let envelope = try parseEnvelope(body)
+			envelope.auth = ctx.request.headers.get("X-Sentry-Auth")
+			envelope.kind = ctx.request.headers.get("Content-Type")
+			envelope.encoding = encoding
+			let status = 200
+			if statuses.len() > 0 {
+				status = statuses[0]
+				statuses = statuses[1:]
+			}
+			envelope.status = status
+			received.push(envelope)
+			if limits.len() > 0 {
+				ctx.setHeader("X-Sentry-Rate-Limits", limits[0]) unless limits[0].isEmpty()
+				limits = limits[1:]
+			}
+			ctx.setHeader("X-Sentry-Error", "refused by the test") when status >= 400
+			return try ctx.text(status, "\{\"id\":\"x\"}")
+		}
+
+		// Every item of type kind received, in order.
+		def items(kind string) Item[] {
+			let found = Item[]
+			for let envelope in received {
+				for let item in envelope.items {
+					found.push(item) when "{item.header["type"]}" == kind
+				}
+			}
+			return found
+		}
+
+		// The drops the client reports taken so far add up to, by `reason|category`.
+		def drops() map<string, int> {
+			let counted = map<string, int>{}
+			let reports = Item[]
+			for let envelope in received {
+				continue unless envelope.status == 200
+				reports = reports + envelope.items.filter(item => "{item.header["type"]}" == "client_report")
+			}
+			for let item in reports {
+				let entries = item.payload["discarded_events"]
+				continue unless entries is any[]
+				let list any[] = entries
+				for let entry in list {
+					continue unless entry is map<string, any>
+					let fields map<string, any> = entry
+					let key = "{fields["reason"]}|{fields["category"]}"
+					counted[key] = (counted.hasKey(key) ?? (counted[key], 0)) + int(fields["quantity"])
+				}
+			}
+			return counted
+		}
+	}
+
+	// An envelope read back: its header, and each item's header and JSON payload, the
+	// payload's length taken from the item header.
+	internal def parseEnvelope(body byte[]) !Envelope {
+		let codec = new JSON()
+		let cut = body.indexOf(byte(10))
+		fail "an envelope header ends with a newline" when cut < 0
+		let envelope = Envelope{header: try objectOf(try codec.parse(body[:cut]))}
+		let at = cut + 1
+		for at < body.len() {
+			let end = body[at:].indexOf(byte(10))
+			fail "an item header ends with a newline" when end < 0
+			let header = try objectOf(try codec.parse(body[at:at + end]))
+			let length = int(header["length"])
+			let start = at + end + 1
+			fail "the payload is as long as its header says" when start + length > body.len()
+			envelope.items.push(Item{header: header, payload: try objectOf(try codec.parse(body[start:start + length]))})
+			at = start + length
+			fail "a payload ends with a newline" unless at < body.len() && body[at] == byte(10)
+			at++
+		}
+		return envelope
+	}
+
+	// A JSON number as a float: a whole one parses as an int.
+	internal def number(value any) float64 {
+		return float64(int(value)) when value is int
+		return float64(value)
+	}
+
+	internal def objectOf(value any) !map<string, any> {
+		return value when value is map<string, any>
+		fail "not a JSON object"
+	}
+
+	// The map under key, empty when there is none.
+	internal def child(fields map<string, any>, key string) map<string, any> {
+		let value = fields.get(key)
+		return value when value is map<string, any>
+		return map<string, any>{}
+	}
+
+	// The array under key, empty when there is none.
+	internal def list(fields map<string, any>, key string) any[] {
+		let value = fields.get(key)
+		return value when value is any[]
+		return any[]
+	}
+
+	internal def started(sentry FakeSentry) !(httptest.Server, Exporter) {
+		let server = try httptest.Server.start(sentry)
+		let exporter = new Exporter("{server.url.replace("http://", "http://public:secret@")}/prefix/42")
+		exporter.compress = false
+		exporter.release = ""
+		exporter.environment = ""
+		return (server, exporter)
+	}
+
+	// What an export failed with; fails when it did not fail with an ExportFailure.
+	internal def failureOf(exporter Exporter, batch TelemetryBatch) !ExportFailure {
+		exporter.export(batch) onerror (err error) {
+			return err when err is ExportFailure
+			fail "export failed with a plain error: {err.message}"
+		}
+		fail "export did not fail"
+	}
+
+	internal def chargeCard() !none {
+		fail "card declined"
+	}
+
+	// An error report with a stack from a real failure.
+	internal def declined(at int64, fields map<string, any> = {}) ErrorReport {
+		let report = ErrorReport{message: "card declined", code: "E42", kind: "billing.CardError", fields: fields, time: at}
+		chargeCard() onerror (err error) {
+			report.stack = err.stack
+			recover none
+		}
+		return report
+	}
+
+	internal const testTrace = "4bf92f3577b34da6a3ce929d0e0e4736"
+	internal const testResource = {"service.name": "shop", "service.version": "1.4.0", "os.type": "linux", "host.arch": "amd64", "app.installation.id": "inst-7", "team": "payments"}
+
+	internal def span(id string, parent string, name string, start int64, end int64) SpanRecord {
+		return SpanRecord{context: SpanContext{trace: testTrace, span: id, sampled: true}, parent: parent, name: name, start: start, end: end}
+	}
+
+	check "Sentry exporter" {
+		@test()
+		def dsnsParse() !none {
+			let dsn = try parseDsn("https://abc:shh@sentry.example.com:9000/base/path/42")
+			try testing.expectEqual("https://sentry.example.com:9000/base/path/api/42/envelope/", envelopeURL(dsn), "the envelope endpoint keeps the path prefix and port")
+			try testing.expectEqual("Sentry sentry_version=7, sentry_client=sentry.adm/0.1.0, sentry_key=abc, sentry_secret=shh", authHeader(dsn), "the auth header")
+			let plain = try parseDsn("https://abc@o1.ingest.sentry.io/7")
+			try testing.expectEqual("https://o1.ingest.sentry.io/api/7/envelope/", envelopeURL(plain), "no prefix")
+			try testing.expectEqual("Sentry sentry_version=7, sentry_client=sentry.adm/0.1.0, sentry_key=abc", authHeader(plain), "no secret")
+			for let bad in ["", "ftp://abc@host/1", "https://host/1", "https://abc@host/", "https://abc@host", "not a url"] {
+				let refused = false
+				parseDsn(bad) onerror (err error) {
+					refused = err is SentryError
+					recover new Dsn()
+				}
+				try testing.expectTrue(refused, "refused: {bad}")
+			}
+			let broken = new Exporter("https://host/1")
+			let failure = try failureOf(broken, TelemetryBatch{errors: [declined(1)]})
+			try testing.expectEqual(1, failure.rejected, "a bad DSN drops what it was given")
+			return none
+		}
+
+		@test()
+		def errorsAreEventsWithBreadcrumbs() !none {
+			let fake = new FakeSentry()
+			let (server, exporter) = try started(fake)
+			exporter.tags = {"region": "eu"}
+			exporter.breadcrumbs = 2
+			exporter.fingerprint = def (report ErrorReport) string[] {
+				return ["{report.kind}", "{report.code}"]
+			}
+			let batch = TelemetryBatch{
+				resource: testResource,
+				logs:     [
+					LogRecord{level: LogLevel.Info, message: "cart opened", time: 1000000000},
+					LogRecord{level: LogLevel.Warning, message: "card slow", fields: {"ms": 900}, time: 2000000000},
+					LogRecord{level: LogLevel.Info, message: "after the error", time: 9000000000},
+				],
+				events: [UsageEvent{name: "checkout.pressed", properties: {"items": 3}, time: 2500000000}],
+				errors: [declined(3000000000, {"order": 7, "user.email": "a@b.c", "url.full": "https://shop/pay", "http.request.method": "POST"})],
+			}
+			try exporter.export(batch)
+			try testing.expectEqual(1, fake.received.len(), "one envelope")
+			let envelope = fake.received[0]
+			try testing.expectEqual("application/x-sentry-envelope", envelope.kind, "the envelope content type")
+			try testing.expectEqual("Sentry sentry_version=7, sentry_client=sentry.adm/0.1.0, sentry_key=public, sentry_secret=secret", envelope.auth, "authenticated by the DSN's key")
+			let event = envelope.items[0].payload
+			try testing.expectEqual("event", "{envelope.items[0].header["type"]}", "an event item")
+			try testing.expectEqual("{envelope.header["event_id"]}", "{event["event_id"]}", "the envelope names the event")
+			try testing.expectEqual(32, "{event["event_id"]}".len(), "a 32-digit id")
+			try testing.expectEqual("shop@1.4.0", "{event["release"]}", "the release from the resource")
+			try testing.expectEqual("production", "{event["environment"]}", "the default environment")
+			try testing.expectEqual("error", "{event["level"]}", "level error")
+			try testing.expectEqual(3.0, number(event["timestamp"]), "the report's time in seconds")
+			let exception = list(child(event, "exception"), "values")
+			try testing.expectEqual(1, exception.len(), "one exception")
+			let raised = try objectOf(exception[0])
+			try testing.expectEqual("billing.CardError", "{raised["type"]}", "the error's type")
+			try testing.expectEqual("card declined", "{raised["value"]}", "its message")
+			let frames = list(child(raised, "stacktrace"), "frames")
+			let last = try objectOf(frames[frames.len() - 1])
+			try testing.expectEqual("adm.telemetry.sentry.chargeCard", "{last["function"]}", "the frame that failed comes last")
+			try testing.expectEqual("sentry_test.adm", "{last["filename"]}", "with its file name")
+			try testing.expectTrue(int(last["lineno"]) > 0, "and line")
+			try testing.expectEqual(false, bool(last["in_app"]), "a library's frame is not in-app")
+			let tags = child(event, "tags")
+			try testing.expectEqual("eu", "{tags["region"]}", "the exporter's tags")
+			try testing.expectEqual("payments", "{tags["team"]}", "resource attributes as tags")
+			try testing.expectEqual("E42", "{tags["error.code"]}", "the error code")
+			try testing.expectFalse(tags.hasKey("service.name"), "the service is a context")
+			try testing.expectEqual("linux", "{child(child(event, "contexts"), "os")["name"]}", "the os context")
+			let user = child(event, "user")
+			try testing.expectEqual("a@b.c", "{user["email"]}", "the user's email from the fields")
+			try testing.expectEqual("inst-7", "{user["id"]}", "the installation as the user")
+			let request = child(event, "request")
+			try testing.expectEqual("https://shop/pay", "{request["url"]}", "the request url")
+			try testing.expectEqual("POST", "{request["method"]}", "the request method")
+			try testing.expectEqual(7, int(child(event, "extra")["order"]), "other fields as extra")
+			try testing.expectEqual("billing.CardError,E42", list(event, "fingerprint").mapElem(f => "{f}").join(","), "the fingerprint")
+			let crumbs = list(child(event, "breadcrumbs"), "values")
+			try testing.expectEqual(2, crumbs.len(), "the latest breadcrumbs before the error")
+			let slow = try objectOf(crumbs[0])
+			try testing.expectEqual("card slow", "{slow["message"]}", "a log record")
+			try testing.expectEqual("warning", "{slow["level"]}", "with its level")
+			let pressed = try objectOf(crumbs[1])
+			try testing.expectEqual("checkout.pressed", "{pressed["category"]}", "a usage event")
+			try testing.expectEqual("user", "{pressed["type"]}", "of type user")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def fatalRecordsAndCompression() !none {
+			let fake = new FakeSentry()
+			let (server, exporter) = try started(fake)
+			exporter.compress = true
+			exporter.environment = "staging"
+			let report = ErrorReport{message: "out of disk", kind: "fatal", time: 5, fatal: true, span: SpanContext{trace: testTrace, span: "00f067aa0ba902b7", sampled: true}}
+			try exporter.export(TelemetryBatch{errors: [report], logs: [LogRecord{level: LogLevel.Fatal, message: "out of disk", time: 5}]})
+			let envelope = fake.received[0]
+			try testing.expectEqual("gzip", envelope.encoding, "compressed")
+			let event = envelope.items[0].payload
+			try testing.expectEqual("fatal", "{event["level"]}", "a fatal event")
+			try testing.expectEqual("out of disk", "{child(event, "logentry")["formatted"]}", "with the message and no exception")
+			try testing.expectFalse(event.hasKey("breadcrumbs"), "the fatal record is not its own breadcrumb")
+			try testing.expectEqual("staging", "{event["environment"]}", "the environment set")
+			let traced = child(child(event, "contexts"), "trace")
+			try testing.expectEqual(testTrace, "{traced["trace_id"]}", "the span it was reported in")
+			let sampling = child(envelope.header, "trace")
+			try testing.expectEqual(testTrace, "{sampling["trace_id"]}", "the trace's sampling context")
+			try testing.expectEqual("public", "{sampling["public_key"]}", "with the DSN's key")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def spansAreTransactions() !none {
+			let fake = new FakeSentry()
+			let (server, exporter) = try started(fake)
+			let lookup = span("2222222222222222", "1111111111111111", "lookup", 2000000000, 3000000000)
+			lookup.attributes = {"sentry.op": "db.query", "rows": 4}
+			let charge = span("3333333333333333", "1111111111111111", "charge", 3000000000, 4000000000)
+			charge.failed = true
+			charge.error = "declined"
+			// The children end first; nothing goes until their parent does.
+			try exporter.export(TelemetryBatch{resource: testResource, spans: [lookup, charge]})
+			try testing.expectEqual(0, fake.received.len(), "children wait for their parent")
+			let root = span("1111111111111111", "00f067aa0ba902b7", "checkout", 1000000000, 5000000000)
+			root.parentRemote = true
+			root.events = [SpanEvent{name: "card.read", time: 2500000000}]
+			try exporter.export(TelemetryBatch{resource: testResource, spans: [root]})
+			let found = fake.items("transaction")
+			try testing.expectEqual(1, found.len(), "one transaction")
+			let tx = found[0].payload
+			try testing.expectEqual("checkout", "{tx["transaction"]}", "named by its first span")
+			try testing.expectEqual(1.0, number(tx["start_timestamp"]), "its start")
+			try testing.expectEqual(5.0, number(tx["timestamp"]), "its end")
+			let context = child(child(tx, "contexts"), "trace")
+			try testing.expectEqual("1111111111111111", "{context["span_id"]}", "the root span")
+			try testing.expectEqual("00f067aa0ba902b7", "{context["parent_span_id"]}", "under another program's span")
+			let children = list(tx, "spans")
+			try testing.expectEqual(2, children.len(), "both children")
+			let first = try objectOf(children[0])
+			try testing.expectEqual("db.query", "{first["op"]}", "the op attribute")
+			try testing.expectEqual(4, int(child(first, "data")["rows"]), "attributes as data")
+			let second = try objectOf(children[1])
+			try testing.expectEqual("internal_error", "{second["status"]}", "a failed span")
+			try testing.expectEqual("declined", "{child(second, "data")["error.message"]}", "with its error")
+			let sampling = child(fake.received[0].header, "trace")
+			try testing.expectEqual("checkout", "{sampling["transaction"]}", "the sampling context names the transaction")
+			try testing.expectEqual("true", "{sampling["sampled"]}", "sampled")
+
+			// A child that ends after its transaction went goes on its own.
+			let late = span("4444444444444444", "1111111111111111", "audit", 4000000000, 6000000000)
+			try exporter.export(TelemetryBatch{spans: [late]})
+			let after = fake.items("transaction")
+			try testing.expectEqual(2, after.len(), "a late child is a transaction of its own")
+			try testing.expectEqual("1111111111111111", "{child(child(after[1].payload, "contexts"), "trace")["parent_span_id"]}", "under its parent")
+
+			// An error after the span event has it as a breadcrumb.
+			try exporter.export(TelemetryBatch{errors: [declined(2600000000)]})
+			let crumbs = list(child(fake.items("event")[0].payload, "breadcrumbs"), "values")
+			try testing.expectEqual("card.read", "{(try objectOf(crumbs[0]))["message"]}", "span events are breadcrumbs")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def samplingAndClientReports() !none {
+			let fake = new FakeSentry()
+			let (server, exporter) = try started(fake)
+			exporter.sampleRate = 0.0
+			try exporter.export(TelemetryBatch{spans: [span("1111111111111111", "", "unsent", 1, 2)]})
+			try testing.expectEqual(0, fake.received.len(), "a trace outside the rate is not sent")
+			try exporter.export(TelemetryBatch{errors: [declined(3)]})
+			let drops = fake.drops()
+			try testing.expectEqual(1, drops["sample_rate|transaction"], "the client report counts the transaction")
+			try testing.expectEqual(1, drops["sample_rate|span"], "and its span")
+			try exporter.export(TelemetryBatch{errors: [declined(4)]})
+			try testing.expectEqual(1, fake.items("client_report").len(), "a drop is reported once")
+			let (kept, draw) = keeps(testTrace, 1.0)
+			try testing.expectTrue(kept && draw >= 0.0 && draw < 1.0, "every trace at rate 1")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def rateLimitsAndRefusals() !none {
+			let fake = new FakeSentry()
+			let (server, exporter) = try started(fake)
+			fake.limits = ["60:transaction;unknown:organization:quota, 5::key"]
+			try exporter.export(TelemetryBatch{errors: [declined(1)]})
+			// For five seconds every category is paused.
+			let paused = try failureOf(exporter, TelemetryBatch{errors: [declined(2)]})
+			try testing.expectEqual(1, paused.rejected, "a paused category is dropped")
+			try testing.expectEqual(1, fake.received.len(), "and not sent")
+
+			let other = new FakeSentry()
+			let (second, again) = try started(other)
+			other.limits = ["60:transaction:organization"]
+			try again.export(TelemetryBatch{errors: [declined(1)]})
+			let limited = try failureOf(again, TelemetryBatch{errors: [declined(2)], spans: [span("1111111111111111", "", "t", 1, 2)]})
+			try testing.expectEqual(1, limited.rejected, "the transaction falls under the limit")
+			try testing.expectEqual(2, other.items("event").len(), "the error does not")
+			try again.export(TelemetryBatch{errors: [declined(3)]})
+			try testing.expectEqual(1, other.drops()["ratelimit_backoff|transaction"], "the drop is reported with the next envelope")
+
+			other.statuses = [429]
+			other.limits = [""]
+			let refused429 = try failureOf(again, TelemetryBatch{errors: [declined(4)]})
+			try testing.expectEqual(1, refused429.rejected, "a 429 drops the event")
+			let pausedAll = try failureOf(again, TelemetryBatch{errors: [declined(5)]})
+			try testing.expectEqual(1, pausedAll.rejected, "and pauses everything for 60 seconds without Retry-After")
+
+			let third = new FakeSentry()
+			let (server3, plain) = try started(third)
+			third.statuses = [400]
+			let refused = try failureOf(plain, TelemetryBatch{errors: [declined(5)]})
+			try testing.expectEqual(1, refused.rejected, "a 400 drops the event")
+			try testing.expectTrue(refused.message.contains("refused by the test"), "naming what the server said")
+			try testing.expectTrue(refused.cause is SentryError, "with a SentryError as the cause")
+			third.statuses = [503]
+			let busy = try failureOf(plain, TelemetryBatch{errors: [declined(6), declined(7)]})
+			try testing.expectEqual(0, busy.rejected, "a 503 drops nothing")
+			let rest = busy.rest
+			fail "a busy server keeps the batch" when rest is none
+			try testing.expectEqual(2, rest.errors.len(), "both errors are tried again")
+			try plain.export(rest)
+			try testing.expectEqual(1, third.drops()["send_error|error"], "the refused event is reported")
+			try server.close()
+			try second.close()
+			try server3.close()
+			return none
+		}
+
+		@test()
+		def logsWhenAskedFor() !none {
+			let fake = new FakeSentry()
+			let (server, exporter) = try started(fake)
+			try exporter.export(TelemetryBatch{logs: [LogRecord{level: LogLevel.Info, message: "hi", time: 1}]})
+			try testing.expectEqual(0, fake.received.len(), "no logs unless asked for")
+			exporter.logs = true
+			let records = LogRecord[]
+			for let i in 0..150 {
+				records.push(LogRecord{level: LogLevel.Warning, message: "record {i}", fields: {"n": i, "ok": true, "ratio": 0.5, "who": "me"}, time: 1000000000, trace: i == 0 ?? (testTrace, ""), span: i == 0 ?? ("00f067aa0ba902b7", "")})
+			}
+			try exporter.export(TelemetryBatch{resource: testResource, logs: records})
+			let found = fake.items("log")
+			try testing.expectEqual(2, found.len(), "at most 100 records an envelope")
+			try testing.expectEqual(100, int(found[0].header["item_count"]), "the item count")
+			try testing.expectEqual("application/vnd.sentry.items.log+json", "{found[0].header["content_type"]}", "the content type")
+			let first = try objectOf(list(found[0].payload, "items")[0])
+			try testing.expectEqual("warn", "{first["level"]}", "the level")
+			try testing.expectEqual(13, int(first["severity_number"]), "its severity number")
+			try testing.expectEqual(testTrace, "{first["trace_id"]}", "the record's trace")
+			let attributes = child(first, "attributes")
+			try testing.expectEqual("integer", "{child(attributes, "n")["type"]}", "an integer attribute")
+			try testing.expectEqual("boolean", "{child(attributes, "ok")["type"]}", "a boolean")
+			try testing.expectEqual("double", "{child(attributes, "ratio")["type"]}", "a double")
+			try testing.expectEqual("shop@1.4.0", "{child(attributes, "sentry.release")["value"]}", "the release")
+			let second = try objectOf(list(found[0].payload, "items")[1])
+			try testing.expectEqual(32, "{second["trace_id"]}".len(), "a record outside a span gets the run's trace")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def monitorsCheckIn() !none {
+			let fake = new FakeSentry()
+			let (server, exporter) = try started(fake)
+			exporter.environment = "prod"
+			let nightly = exporter.monitor("nightly-import")
+			nightly.crontab = "0 3 * * *"
+			nightly.timezone = "Europe/London"
+			nightly.margin = 90s
+			nightly.maxRuntime = 30min
+			try nightly.run(def () !none {
+				return none
+			})
+			let checks = fake.items("check_in")
+			try testing.expectEqual(2, checks.len(), "a run is two check-ins")
+			try testing.expectEqual("in_progress", "{checks[0].payload["status"]}", "begun")
+			try testing.expectEqual("ok", "{checks[1].payload["status"]}", "then ended well")
+			try testing.expectEqual("{checks[0].payload["check_in_id"]}", "{checks[1].payload["check_in_id"]}", "the same run")
+			try testing.expectTrue(checks[1].payload.hasKey("duration"), "the end carries the duration")
+			try testing.expectEqual("prod", "{checks[1].payload["environment"]}", "the environment")
+			let config = child(checks[0].payload, "monitor_config")
+			try testing.expectEqual("crontab", "{child(config, "schedule")["type"]}", "the schedule")
+			try testing.expectEqual(2, int(config["checkin_margin"]), "the margin in minutes, rounded up")
+			try testing.expectEqual(30, int(config["max_runtime"]), "the longest run in minutes")
+			try testing.expectEqual("Europe/London", "{config["timezone"]}", "the time zone")
+
+			let hourly = exporter.monitor("hourly")
+			hourly.interval = 2h
+			let failed = false
+			hourly.run(def () !none {
+				fail "no data"
+			}) onerror (err error) {
+				failed = err.message == "no data"
+				recover none
+			}
+			try testing.expectTrue(failed, "the job's error comes back")
+			let after = fake.items("check_in")
+			try testing.expectEqual("error", "{after[3].payload["status"]}", "a failed run")
+			let schedule = child(child(after[2].payload, "monitor_config"), "schedule")
+			try testing.expectEqual(2, int(schedule["value"]), "an interval in its largest unit")
+			try testing.expectEqual("hour", "{schedule["unit"]}", "hours")
+			let bare = exporter.monitor("bare").start()
+			bare.ok()
+			bare.ok()
+			try testing.expectEqual(6, fake.items("check_in").len(), "a run reports its end once")
+			try testing.expectFalse(fake.items("check_in")[5].payload.hasKey("monitor_config"), "no schedule, no configuration")
+			try testing.expectEqual("week", "{periodOf(336h)["unit"]}", "two weeks")
+			try testing.expectEqual("minute", "{periodOf(90s)["unit"]}", "90 seconds round up to 2 minutes")
+			try exporter.close()
+			try server.close()
+			return none
+		}
+
+		@test()
+		def checkInsGoAsTheyAreGiven() !none {
+			let fake = new FakeSentry()
+			let (server, exporter) = try started(fake)
+			let monitor = exporter.monitor("direct")
+			try testing.expectTrue(exporter.checkIn(monitor.payload("run-1", wallNow(), "ok")), "a check-in the server takes")
+			let later = exporter.checkInLater(monitor.payload("run-2", wallNow(), "in_progress"))
+			try testing.expectTrue(await later, "one sent on its own task")
+			let checks = fake.items("check_in")
+			try testing.expectEqual("run-1,run-2", checks.mapElem(c => "{c.payload["check_in_id"]}").join(","), "both arrive")
+			fake.statuses = [500]
+			try testing.expectFalse(exporter.checkIn(monitor.payload("run-3", wallNow(), "ok")), "one the server fails on")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def closeSendsWaitingSpans() !none {
+			let fake = new FakeSentry()
+			let (server, exporter) = try started(fake)
+			try exporter.export(TelemetryBatch{spans: [span("2222222222222222", "1111111111111111", "orphan", 1, 2)]})
+			try testing.expectEqual(0, fake.received.len(), "a child waits")
+			try exporter.close()
+			try testing.expectEqual(1, fake.items("transaction").len(), "close sends it as a transaction")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def liveProject() !none {
+			return none when liveDsn.isEmpty()
+			let exporter = new Exporter(liveDsn)
+			exporter.environment = "adm-test"
+			exporter.logs = true
+			try exporter.export(TelemetryBatch{
+				resource: {"service.name": "adm-test", "service.version": "0.1.0"},
+				logs:     [LogRecord{level: LogLevel.Info, message: "adm-test log", time: wallNow()}],
+				errors:   [declined(wallNow())],
+				spans:    [SpanRecord{context: SpanContext{trace: eventId(), span: eventId()[:16], sampled: true}, name: "adm-test", start: wallNow() - 1000000, end: wallNow()}],
+			})
+			try exporter.monitor("adm-test").run(def () !none {
+				return none
+			})
+			try exporter.close()
+			return none
+		}
+	}
+}
